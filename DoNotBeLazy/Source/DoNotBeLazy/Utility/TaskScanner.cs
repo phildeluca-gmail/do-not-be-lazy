@@ -39,7 +39,30 @@ namespace DoNotBeLazy.Utility
             float radiusSquared = radius * radius;
             Area allowedArea = forPawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
 
-            foreach (Thing thing in scanner.PotentialWorkThingsGlobal(forPawn))
+            // PotentialWorkThingsGlobal returns NULL on the base class (its
+            // IL is literally ldnull/ret) and most WorkGivers never override
+            // it - construction and bills included. Iterating that straight
+            // was an NRE. Vanilla's JobGiver_Work does the same thing we do
+            // here: fall back to the thing lister for scanThings givers.
+            // Cell-only givers (scanCells, e.g. clear snow) find nothing,
+            // which is the intended no-op rather than a crash.
+            IEnumerable<Thing> candidates = scanner.PotentialWorkThingsGlobal(forPawn);
+            if (candidates == null && workGiverDef.scanThings)
+            {
+                ThingRequest req = scanner.PotentialWorkThingRequest;
+                // ThingsMatching throws on an undefined request
+                if (!req.IsUndefined)
+                {
+                    candidates = map.listerThings.ThingsMatching(req);
+                }
+            }
+
+            if (candidates == null)
+            {
+                return results;
+            }
+
+            foreach (Thing thing in candidates)
             {
                 if (thing == null || thing.Map != map)
                 {

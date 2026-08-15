@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+// using System.Collections.Generic;  // was for the EndingJobs dict, __state replaced it
 using HarmonyLib;
 using RimWorld;
 using Verse;
@@ -23,7 +23,13 @@ namespace DoNotBeLazy.Patches
     //
     // curJob is cleared (and can already be replaced by a new job) partway
     // through EndCurrentJob's own body, so the Prefix captures it before
-    // that happens and the Postfix reads it back.
+    // that happens and the Postfix reads it back via Harmony's __state.
+    //
+    // (was a static Dictionary<Pawn_JobTracker, Job> keyed on the instance -
+    // EndCurrentJob nests, so an inner call overwrote and then removed the
+    // outer call's entry and the outer postfix saw nothing. __state is
+    // per-call so nesting is a non-issue, and nothing leaks if a postfix
+    // never runs.)
     //
     // Depends on SweepManager and SweepOrder (Phase 3), which must expose:
     //   bool TryGetActiveSweep(Pawn pawn, out SweepOrder order)
@@ -34,21 +40,23 @@ namespace DoNotBeLazy.Patches
     [HarmonyPatch(typeof(Pawn_JobTracker), nameof(Pawn_JobTracker.EndCurrentJob))]
     public static class JobTrackerPatch
     {
-        private static readonly Dictionary<Pawn_JobTracker, Job> EndingJobs = new Dictionary<Pawn_JobTracker, Job>();
-
         [HarmonyPriority(Priority.First)]
-        public static void Prefix(Pawn_JobTracker __instance)
+        public static void Prefix(Pawn_JobTracker __instance, out Job __state)
         {
-            EndingJobs[__instance] = __instance.curJob;
+            __state = __instance.curJob;
         }
 
-        public static void Postfix(Pawn_JobTracker __instance, JobCondition condition, Pawn ___pawn)
+        public static void Postfix(JobCondition condition, Pawn ___pawn, Job __state)
         {
-            if (!EndingJobs.TryGetValue(__instance, out Job endedJob))
+            // we're inside our own TryTakeOrderedJob - this job end is the
+            // interrupt we caused, not the pawn finishing something. Acting
+            // on it cancels the sweep we're in the middle of handing out.
+            if (SweepManager.AssigningJob)
             {
                 return;
             }
-            EndingJobs.Remove(__instance);
+
+            Job endedJob = __state;
 
             Pawn pawn = ___pawn;
             if (pawn == null || endedJob == null)
@@ -76,7 +84,7 @@ namespace DoNotBeLazy.Patches
                 Job nextBillJob = scanner.JobOnThing(pawn, billGiver);
                 if (nextBillJob != null)
                 {
-                    pawn.jobs.TryTakeOrderedJob(nextBillJob, JobTag.Misc);
+                    SweepManager.GiveJob(pawn, nextBillJob);
                     return;
                 }
             }

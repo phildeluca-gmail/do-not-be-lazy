@@ -1,6 +1,81 @@
-<!-- Updated: 2026-08-13 20:14 EDT -->
+<!-- Updated: 2026-08-15 EDT - Phase 3 complete, build green -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
+
+## 0. Current Status (2026-08-15)
+
+Phases 1-3 are implemented, an Opus compatibility/correctness pass has
+been run over the Phase 3 files, and the project builds clean (`dotnet
+build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). Not yet
+tested in a running game - see Phase 4 in section 5.2.
+
+Files that exist and their state:
+- Phase 1: `DoNotBeLazyMod.cs`, `Logger.cs`, `About.xml`, `.csproj` - done.
+- Phase 2: `DoNotBeLazySettings.cs`, `PawnValidator.cs`, `TaskScanner.cs`,
+  `NeedMonitor.cs`, `JobTrackerPatch.cs` - done. No separate
+  `JobDriver_AreaSweep.cs` was needed or written - see section 3.2.
+- Phase 3: `SweepManager.cs`, `FloatMenuPatch.cs` - done, reviewed, and
+  patched for a critical bug (below). See 3.2/3.3 for how these ended up
+  differing from the original plan.
+
+Several implementation decisions were made this session that revise the
+original plan in this document. They're captured inline in the relevant
+sections rather than listed separately, so section 3 below reflects
+current reality, not the original design. The main ones, for a quick
+diff against memory:
+
+- **No `FloatMenuMakerMap.GetOptions` method exists** in the actual game
+  DLL for this version (1.5.9214.33606) - confirmed by reflecting on
+  `lib/Assembly-CSharp.dll` directly rather than trusting recollection.
+  The real integration points are `ChoicesAtFor` (1 pawn) and
+  `ChoicesAtForMultiSelect` (2+ pawns). See 3.2/3.3.
+- FloatMenuPatch does **not** clone existing FloatMenuOptions. It
+  independently determines eligible WorkGiverDefs and only offers a sweep
+  when a normal action would already apply (mirrors vanilla's own
+  `HasJobOnThing` check rather than introspecting the menu vanilla built).
+- **Single-pawn selections are supported.** Both `ChoicesAtFor` and
+  `ChoicesAtForMultiSelect` are patched, as two nested `[HarmonyPatch]`
+  classes inside `FloatMenuPatch` sharing one builder. No known gap left
+  on selection size.
+- `JobDriver_AreaSweep.cs` was dropped. Workstation bill continuation
+  ("stop after one bill") is handled by `JobTrackerPatch` re-asking the
+  `WorkGiverDef`'s scanner for another job on the same bill giver each
+  time a `DoBill` job ends - no custom JobDriver needed.
+- `SweepManager`'s job-to-job chaining is event-driven off
+  `JobTrackerPatch`'s postfix (`Notify_JobEnded`), not tick-polled as
+  originally described. `MapComponentTick` only does the periodic
+  death/downed/mental/drafted/off-map cleanup check.
+- **Critical bug found and fixed in the Opus pass:** `TryTakeOrderedJob`
+  re-enters `EndCurrentJob` (`TryTakeOrderedJob` -> `StartJob` ->
+  `EndCurrentJob`, confirmed via IL), so every job handout the mod made
+  was firing `JobTrackerPatch`'s own postfix, which read it as the pawn's
+  job ending and cancelled the sweep it had just started. Every sweep
+  would have died after its first task. Fixed via `SweepManager.GiveJob`
+  + a reentrancy flag (`AssigningJob`) that `JobTrackerPatch` checks and
+  ignores. See section 3.2 SweepManager for detail.
+- The same pass fixed several other real bugs (NRE risk in
+  `TaskScanner.FindTargets` when `PotentialWorkThingsGlobal` returns null
+  for most WorkGivers, a `Dictionary`-mutated-during-iteration crash in
+  `NeedMonitor`, a nesting-unsafe static dictionary in `JobTrackerPatch`,
+  missing per-pawn area-restriction re-checks, a silent no-op when the
+  best workstation pawn couldn't actually get a job, and no exception
+  guard around the float-menu postfix body) and added defensive/perf
+  fixes (cached eligible-WorkGiverDef list, map derived from the first
+  *spawned* pawn since caravan/world pawns have null `Map`). Full detail
+  is folded into the relevant component descriptions in 3.2.
+- **Static Achtung compatibility check run against the actual installed
+  Achtung 1.5 DLL** (not guessed) - see the Achtung bullet in section 4.
+  One item remains open: Achtung's transpiler on `EndCurrentJob` hasn't
+  been tested in a running game together with our patch on the same
+  method.
+- Known open items, not yet closed: `showSweepOverlay` setting has no
+  code behind it (section 3.4); `JobTrackerPatch`'s bill-continuation
+  branch doesn't verify the ended job's target is the sweep's own bill
+  giver (low risk, documented assumption); WorkGivers that only
+  `scanCells` (e.g. clear-snow) never produce a sweep option; multiple
+  WorkGiverDefs covering one activity (e.g. construction's
+  deliver-resources vs finish-frame givers) can produce more than one
+  `*` entry for the same click - menu-noise question, not a bug.
 
 ## 1. Intent
 
@@ -60,23 +135,40 @@ DoNotBeLazy/
 
 ### 3.2 Component Descriptions
 
-**FloatMenuPatch.cs** - Harmony postfix on `FloatMenuMakerMap.GetOptions`. In RimWorld 1.5, this method receives `List<Pawn> selectedPawns` and returns `List<FloatMenuOption>`. The postfix iterates the existing options, creates asterisked clones for each valid one, and appends them to the list. Each clone's action delegate calls into `SweepManager.BeginSweep()`.
+**FloatMenuPatch.cs** - Two Harmony postfixes, on `FloatMenuMakerMap.ChoicesAtFor(Vector3 clickPos, Pawn pawn, bool suppressAutoTakeableGoto)` and `FloatMenuMakerMap.ChoicesAtForMultiSelect(Vector3 clickPos, List<Pawn> pawns)`. There is no `GetOptions` method on this class in the real 1.5 DLL (verified by reflecting on `lib/Assembly-CSharp.dll`); those two are the real entry points, plus internal helpers `AddHumanlikeOrders`/`AddJobGiverWorkOrders` that build the base list. Both are patched (as nested classes `FloatMenuPatch.SingleSelect` / `FloatMenuPatch.MultiSelect`, both discovered by `PatchAll` since it enumerates nested types), so sweeps work with any selection size.
 
-**SweepManager.cs** - A `MapComponent` that maintains a dictionary of active sweep assignments (`Dictionary<Pawn, SweepOrder>`). `SweepOrder` stores: originating cell, radius, WorkGiverDef, and remaining task queue. On `MapComponentTick()`, it checks whether each pawn has finished their current task and assigns the next one in the queue via `pawn.jobs.StartJob()`.
+The postfix body is wrapped in a try/catch that logs and swallows: an exception escaping a float-menu postfix takes the whole right-click menu down for every other mod patching the same area (Achtung). The sweep-eligible `WorkGiverDef` list is computed once and cached rather than re-walking `DefDatabase` on every right-click.
+
+Rather than cloning existing `FloatMenuOption` entries (they don't expose the `WorkGiverDef` that produced them, so there's nothing to key a sweep off), the postfix independently walks `DefDatabase<WorkGiverDef>.AllDefsListForReading`, filters to sweep-eligible defs (see below), converts `clickPos` to a cell, and for each eligible def checks whether any selected pawn has `HasJobOnThing` true against a thing at that cell - the same predicate vanilla itself uses to decide whether to show the normal option. If so, it appends one `* <label>` `FloatMenuOption` whose action calls `SweepManager.BeginSweep(eligiblePawns, target, workGiverDef)`.
+
+Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, or `Mining`.
+
+**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below).
+
+Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool.
+
+Because `TryTakeOrderedJob` interrupts the pawn's current job, it re-enters `EndCurrentJob` (verified in IL: `TryTakeOrderedJob` -> `StartJob` -> `EndCurrentJob`), so every job handout the mod makes fires `JobTrackerPatch`'s own postfix with `InterruptForced` - which used to cancel the sweep that was mid-handout. All handouts now go through `SweepManager.GiveJob`, which raises a static `SweepManager.AssigningJob` flag that `JobTrackerPatch` checks and ignores. `MapComponentTick()` runs every 60 ticks and only checks for state changes nothing else observes - dead/downed/mental-break/drafted/off-map pawns get pulled from `activeSweeps`.
+
+Workstation pawn selection (`PickBestWorkstationPawn`) ranks by skill level in the WorkGiverDef's primary relevant skill, then `StatDefOf.WorkSpeedGlobal`, then `StatDefOf.MoveSpeed`. The doc's original idea of tiebreaking on the specific per-trade stat (`SmithingSpeed` etc.) was dropped for v1 - there's no generic way to resolve "the specific stat for this WorkTypeDef" from the def alone, so `WorkSpeedGlobal` stands in. Revisit if it causes visibly wrong pawn picks in testing.
+
+No `ExposeData()` on `SweepManager` - sweeps are cleared on load, matching the "simpler, recommended for v1" option in section 4.
 
 **NeedMonitor.cs** - A `GameComponent` that runs a tick check (every 60 ticks for performance) on all pawns with active sweeps. If hunger, recreation, or sleep is at or below 5% (`need.CurLevelPercentage <= 0.05f`), it clears the pawn's sweep from `SweepManager` and ends their current forced job so the AI takes over for need satisfaction.
 
-**TaskScanner.cs** - Static utility. Given a cell, radius, map, and `WorkGiverDef`, returns a `List<LocalTargetInfo>` of all matching incomplete tasks. Uses `GenRadial.RadialCellsAround()` for the 16-tile search. Filters out tasks already claimed by another pawn (reserved or in another sweep).
+**TaskScanner.cs** - Static utility. Given a cell, radius, map, `WorkGiverDef`, and a driving pawn, returns a `List<LocalTargetInfo>` of matching incomplete tasks. Implemented as `scanner.PotentialWorkThingsGlobal(forPawn)` filtered by squared-distance-from-center, forbidden, allowed area, `CanReserve`, and `HasJobOnThing` - not `GenRadial.RadialCellsAround()` as originally planned, since the WorkGiver API is already thing-scoped and iterating things directly avoids an 800-cell scan.
 
-**PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: work type enabled, not incapable, not downed, not in mental state, skill minimums met.
+`PotentialWorkThingsGlobal` returns **null** on `WorkGiver_Scanner` itself and most WorkGivers never override it (construction and `WorkGiver_DoBill` included), so the scanner falls back to `map.listerThings.ThingsMatching(scanner.PotentialWorkThingRequest)` for `scanThings` givers, guarding against an undefined `ThingRequest` (which `ThingsMatching` throws on). This mirrors what vanilla's `JobGiver_Work` does. Cell-scanned (`scanCells`) givers such as clear-snow find nothing and simply offer no sweep. Filters out tasks already claimed by another pawn via the normal reservation system (no sweep-specific claim tracking needed).
 
-**JobDriver_AreaSweep.cs** - Thin wrapper. For most task types, the mod does not need a custom JobDriver. Instead, `SweepManager` issues the same vanilla `Job` the float menu would have created, but chains them sequentially. The JobDriver is only needed for workstation tasks where we override the "stop after one bill" behavior by requeuing.
+**PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity.
+
+**JobDriver_AreaSweep.cs** - Not written; turned out to be unnecessary. Workstation "stop after one bill" is overridden without a custom JobDriver: `JobTrackerPatch`'s postfix on `EndCurrentJob` checks if the ending job was `JobDefOf.DoBill` on a sweep's bill giver, and if so directly asks the `WorkGiver_Scanner` for another job on that same giver before falling through to `SweepManager`. `SweepManager` otherwise issues the same vanilla `Job` the float menu would have created, chained sequentially via `Notify_JobEnded`.
 
 ### 3.3 Key Integration Points
 
 | RimWorld Class | Method | Patch Type | Purpose |
 |---|---|---|---|
-| `FloatMenuMakerMap` | `GetOptions` | Postfix | Append `*` entries to menu |
+| `FloatMenuMakerMap` | `ChoicesAtFor` | Postfix | Append `*` entries to menu (1 pawn selected) |
+| `FloatMenuMakerMap` | `ChoicesAtForMultiSelect` | Postfix | Append `*` entries to menu (2+ pawns selected) |
 | `Pawn_JobTracker` | `EndCurrentJob` | Postfix | Notify SweepManager to queue next task |
 | `Need` | `CurLevelPercentage` | (read only) | Polled by NeedMonitor, no patch needed |
 
@@ -84,11 +176,15 @@ DoNotBeLazy/
 
 - `sweepRadius` - int, default 16, configurable 1-50
 - `needThreshold` - float, default 0.05 (5%), configurable 0.01-0.20
-- `showSweepOverlay` - bool, default true (highlight radius on hover)
+- `showSweepOverlay` - bool, default true (highlight radius on hover) - **setting exists but nothing reads it yet**; no overlay-drawing code has been written. Not in the Phase 1-3 plan as a separate task, so it fell out of scope. Needs a task added (likely a `MapComponent.MapComponentOnGUI()` or `MapComponent.MapComponentUpdate()` override) before this setting does anything.
 
 ## 4. Edge Cases and Risks
 
-- **Achtung! compatibility:** Achtung also patches `AddJobGiverWorkOrders` and `GetOptions`. Use postfix-only patching with null checks. Do not use transpilers.
+- **Achtung! compatibility:** Checked against the actual installed Achtung 1.5 DLL (`Achtung.dll`, reflected directly rather than guessed) at `E:\SteamLibrary\steamapps\workshop\content\294100\730936602\1.5\Assemblies\`. Findings:
+  - `ChoicesAtForMultiSelect` (our 2+ pawn path): Achtung does not touch this method at all. No overlap.
+  - `ChoicesAtFor` (our single-pawn path): Achtung postfixes it too (`FloatMenuMakerMap_ChoicesAtFor_Postfix`, appends its own options to the same `__result` list). Two postfixes stacking on one method is standard, low-risk Harmony usage - should compose fine regardless of load order since neither replaces the list, only appends to it.
+  - `Pawn_JobTracker.EndCurrentJob` (our `JobTrackerPatch.cs`): Achtung applies a **Prefix, Postfix, AND a Transpiler** here. The transpiler is the one real unknown - it rewrites the method's IL, which is a deeper interaction than pre/postfix stacking. Our prefix (captures `curJob` before the body clears it) should still fire before whatever transpiled body runs, so it's likely fine, but this can't be fully confirmed by static analysis alone - **needs an actual in-game test with Achtung loaded** before calling this solid. Everything else here is verified; this is the one open item.
+  - Also worth noting for later: Achtung patches `FloatMenuMakerMap.ScannerShouldSkip`, which our code doesn't call at all (we go straight to `HasJobOnThing`). If Achtung's patch suppresses certain WorkGivers under conditions vanilla wouldn't, our sweep option could still appear in a case Achtung intentionally hides the normal one. Cosmetic/UX risk, not a crash risk.
 - **Reservation compliance:** Vanilla reservation system is respected, not overridden. `TaskScanner` filters out reserved targets via `map.reservationManager.CanReserve()`. For workstations, only the highest-skilled pawn in the selection is assigned; others are skipped for that task type.
 - **Workstation bill depletion:** Bills can require materials. If materials run out mid-sweep, the pawn should gracefully exit the sweep rather than idle at the station.
 - **Save/Load:** `SweepManager` should implement `ExposeData()` to persist active sweeps across saves, or clear them on load (simpler, recommended for v1).
@@ -144,15 +240,24 @@ Recommended workflow: start the session with `claude --model sonnet` (the workho
 | `PawnValidator.cs` | Work type checks, skill checks, state checks against RimWorld API |
 | `TaskScanner.cs` | `GenRadial` usage, reservation checks, forbidden/area filtering, result caching |
 | `NeedMonitor.cs` | 60-tick polling, need threshold check, job clearing |
-| `JobDriver_AreaSweep.cs` | Workstation bill re-queue logic, toil chaining |
-| `Pawn_JobTracker.EndCurrentJob` postfix | Notify SweepManager on job completion |
+| ~~`JobDriver_AreaSweep.cs`~~ | **Done differently** - not written, turned out unnecessary. Bill re-queue logic lives in `JobTrackerPatch` itself instead. |
+| `Pawn_JobTracker.EndCurrentJob` postfix | Done - `JobTrackerPatch.cs` |
 
-#### Phase 3 - Complex Integration (`/model opus`)
+**Done.** Note: this session ran on Sonnet throughout (not switched to Haiku/Opus per phase) - see status note at top of doc.
+
+#### Phase 3 - Complex Integration (`/model opus`) - DONE (built on Sonnet, not Opus - see below)
 
 | Task | Notes |
 |---|---|
-| `FloatMenuPatch.cs` | Postfix on `GetOptions`. Must clone `FloatMenuOption` actions correctly, handle 1.5 multi-pawn `selectedPawns`, append entries in order, wire delegates. Highest compatibility risk. |
-| `SweepManager.cs` | Stateful `MapComponent`. Tick-level job chaining, pawn state monitoring (death/downed/mental), sweep replacement, workstation best-pawn selection with tiebreakers. |
+| `FloatMenuPatch.cs` | **Done, but not as originally planned.** No `GetOptions` method exists in this game version's DLL (confirmed via reflection on `lib/Assembly-CSharp.dll`) - patched `ChoicesAtFor` and `ChoicesAtForMultiSelect` instead (both selection sizes covered). Does not clone existing `FloatMenuOption`s (not feasible - they don't expose their originating `WorkGiverDef`); independently determines eligible actions instead. See section 3.2 for full detail. |
+| `SweepManager.cs` | Done. Job chaining is event-driven via `Notify_JobEnded` (called from `JobTrackerPatch`), not tick-polled. `MapComponentTick` only runs the pawn-state validity check. Workstation best-pawn tiebreaker uses `WorkSpeedGlobal` instead of the per-trade stat named in the original plan. See section 3.2. |
+
+This phase was implemented on Sonnet rather than Opus per the original
+model plan (session was already running Sonnet when the work started;
+not manually switched). Build is clean, but this is exactly the
+highest-risk phase the plan called out for Opus - **an Opus compatibility
+pass over `FloatMenuPatch.cs` and `SweepManager.cs` before relying on
+this in a real save is still worth doing**, per Phase 4 below.
 
 #### Phase 4 - Polish and QA (`/model sonnet` then `/model opus`)
 
