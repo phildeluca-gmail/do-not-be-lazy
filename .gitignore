@@ -2,6 +2,7 @@
 bin/
 obj/
 DoNotBeLazy/Assemblies/*.dll
+DoNotBeLazy/Assemblies/*.pdb
 *.user
 
 # Reference DLLs (copyrighted third-party/game files - not ours to redistribute)
