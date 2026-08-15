@@ -1,0 +1,16 @@
+# Build artifacts
+bin/
+obj/
+DoNotBeLazy/Assemblies/*.dll
+*.user
+
+# Reference DLLs (copyrighted third-party/game files - not ours to redistribute)
+lib/
+
+# Editor/OS cruft
+.vs/
+*.suo
+Thumbs.db
+
+# Local Claude Code settings (machine-specific, not shared)
+.claude/settings.local.json

@@ -1,0 +1,77 @@
+<!-- Updated: 2026-08-13 20:22 EDT -->
+
+# CLAUDE.md - Do Not Be Lazy (RimWorld 1.5 Mod)
+
+This file governs how Claude Code operates in this project. Read it fully before taking any action.
+
+---
+
+## Referenced Documents
+
+Load all referenced documents at the start of every session and before any implementation work begins.
+
+- `./DoNotBeLazy_Architecture.md` - Mod architecture document. Defines intent, core behaviors, component structure, edge cases, Claude Code execution plan with model assignments, and dependency setup.
+- `./human-style-coding-260327.md` - Human-style coding guide. Defines comment style, naming conventions, abstraction rules, and stylistic drift. Written for JS/Python examples but applies to C# with the overrides below.
+
+---
+
+## When to Consult Each Document
+
+**Before writing any code**, read both documents above.
+
+**Before making architectural decisions, adding Harmony patches, creating new files, or changing the component structure**, re-read the relevant section of `./DoNotBeLazy_Architecture.md`.
+
+**Before working on the float menu patch, sweep manager, task scanner, or need monitor**, re-read the component description and edge cases even if you have read them already in this session.
+
+---
+
+## C# and RimWorld Overrides to Coding Guide
+
+The human-style coding guide applies with these modifications:
+
+- This is C# targeting .NET Framework 4.7.2. Use C# conventions (PascalCase for methods/properties, camelCase for locals/params).
+- RimWorld modding works against a decompiled API with no official documentation. Comments explaining what a RimWorld method actually does ARE valuable here. The "don't comment the what" rule is relaxed for Verse/RimWorld API calls.
+- Harmony patch classes should have a brief comment stating which method they patch and why, since the attribute annotations alone can be cryptic.
+- Use `Verse` and `RimWorld` namespaces. Do not alias them.
+- Prefer Harmony postfix patches. Do not use transpilers unless the architecture doc explicitly calls for one (it currently does not).
+
+---
+
+## Model Assignments
+
+Follow the model plan in Section 5 of `./DoNotBeLazy_Architecture.md`. Switch models using `/model haiku`, `/model sonnet`, or `/model opus` as specified per phase. Do not use a more expensive model than the plan calls for unless the task fails or produces errors at the assigned tier.
+
+---
+
+## Conflict Resolution
+
+If instructions in `./DoNotBeLazy_Architecture.md` and `./human-style-coding-260327.md` appear to conflict, stop and ask before proceeding. Do not resolve the conflict yourself. State the conflict clearly and wait for a decision.
+
+If a task falls outside the scope of both documents, ask before making assumptions.
+
+---
+
+## General Behavior
+
+- Do not add Harmony patches, files, or dependencies not described in `./DoNotBeLazy_Architecture.md` unless explicitly instructed.
+- Do not add NuGet packages. All dependencies are local DLLs in `./lib/` (see Section 6.0 of the architecture doc).
+- Do not deviate from the code style in `./human-style-coding-260327.md` for reasons of preference or convention.
+- When in doubt about scope or approach, ask. A short clarifying question is better than an incorrect assumption.
+- Do not silently fix or normalize code you did not write in this session.
+
+---
+
+## Git
+
+Repository setup is manual. The developer creates the repo on GitHub and runs `git init` / `git remote add` before Claude Code handles commits.
+
+For commits during a session, use:
+```
+git add -A && git commit -m "message" && git push
+```
+
+---
+
+## Document Updates
+
+Both referenced documents are living documents and will be updated during development. When asked to implement a change that requires updating `./DoNotBeLazy_Architecture.md` or `./human-style-coding-260327.md`, make the edit to the document and confirm the change before implementing any code that depends on it.
