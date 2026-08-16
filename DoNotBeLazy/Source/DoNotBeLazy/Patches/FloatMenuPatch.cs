@@ -34,10 +34,14 @@ namespace DoNotBeLazy.Patches
     public static class FloatMenuPatch
     {
         // Hauling/Construction/Cleaning/Mining/Growing per architecture doc
-        // section 2's examples. Workstation bills aren't listed by name here
-        // - any WorkGiverDef whose Worker is WorkGiver_DoBill qualifies
-        // regardless of WorkTypeDef, since there's one per crafting station
-        // and hardcoding them all would break against mod/DLC additions.
+        // section 2's examples. PlantCutting added separately from Growing -
+        // cutting/chopping plants (PlantsCut) is its own WorkTypeDef, not
+        // part of Growing, and was missing entirely (clicking an
+        // already-marked-for-cutting plant did nothing). Workstation bills
+        // aren't listed by name here - any WorkGiverDef whose Worker is
+        // WorkGiver_DoBill qualifies regardless of WorkTypeDef, since
+        // there's one per crafting station and hardcoding them all would
+        // break against mod/DLC additions.
         private static readonly HashSet<string> SupportedWorkTypeDefNames = new HashSet<string>
         {
             "Hauling",
@@ -45,6 +49,7 @@ namespace DoNotBeLazy.Patches
             "Cleaning",
             "Mining",
             "Growing",
+            "PlantCutting",
         };
 
         // CookFillHopper (workType Hauling, vanilla defName) matches on any
@@ -135,6 +140,22 @@ namespace DoNotBeLazy.Patches
             // crops) target the clicked cell itself, which is normally
             // empty by definition
             List<Thing> thingsHere = cell.GetThingList(map);
+
+            // GrowerSow/GrowerHarvest are both scanCells (target the cell
+            // itself, not a Thing on it) and neither checks for fire - a
+            // burning farm tile with a scorched-but-still-mature plant on
+            // it, or one already burnt down to bare ground, still passes
+            // HasJobOnCell. Bail on the whole click rather than special-case
+            // each WorkGiverDef: nothing we offer is sensible to send pawns
+            // into while it's on fire. Firefighting itself needs no manual
+            // order - it's emergency/auto-taken (see IsSweepEligible).
+            foreach (Thing thing in thingsHere)
+            {
+                if (thing is Fire)
+                {
+                    return;
+                }
+            }
 
             foreach (WorkGiverDef def in EligibleDefs())
             {
@@ -307,6 +328,16 @@ namespace DoNotBeLazy.Patches
         private static bool IsSweepEligible(WorkGiverDef def)
         {
             if (def == null || ExcludedDefNames.Contains(def.defName))
+            {
+                return false;
+            }
+            // directOrderable defaults true and is only set false on defs
+            // vanilla deliberately keeps out of the player's hands - e.g.
+            // FightFires (emergency-only, auto-taken by any idle pawn
+            // regardless of orders; that's why there's no vanilla "put out
+            // fire" menu option either). Respecting this generally is safer
+            // than denylisting each one we happen to trip over.
+            if (!def.directOrderable)
             {
                 return false;
             }

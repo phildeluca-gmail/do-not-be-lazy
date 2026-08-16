@@ -11,6 +11,56 @@ mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
 
 **From in-game testing (2026-08-15):**
+- **Behavior change, by explicit request: sweeps now resume after a need
+  interrupt instead of ending.** Original design (see section 2 history)
+  deliberately did NOT auto-resume, to avoid interrupt loops. Reversed:
+  `NeedMonitor` now calls `SweepManager.PauseForNeed` instead of
+  `RemoveSweep` - the sweep order stays alive, the pawn's forced job ends
+  so vanilla AI sends them to eat/sleep/recreate, and once *that* job
+  ends on its own `Notify_JobEnded` sees the pawn was paused and resumes
+  them (next pool target, or the same workstation for a `WorkGiver_DoBill`
+  order - `SweepOrder` now carries a `WorkstationTarget` Thing so a
+  paused cooking/crafting pawn can be sent back to the same station, not
+  just area sweeps). No repeated-pause spam: `NeedMonitor` skips pawns
+  already marked paused rather than re-triggering every 60 ticks while
+  they sleep it off. Interrupt-loop risk doesn't reappear here because
+  resumption is gated on a real job-end event, not a repeated need check.
+- **Fixed: right-clicking fire offered `* Sow crops` / `* Harvest crops`
+  instead of putting the fire out.** Two things going on:
+  - `GrowerHarvest` turned out to be `scanCells` too (not `scanThings` as
+    assumed) - same shape as `GrowerSow`, and neither checks for fire on
+    the cell, so a scorched-but-still-mature plant (or a cell already
+    burnt bare) still passes `HasJobOnCell`.
+  - `FightFires` is `directOrderable: false` in vanilla - firefighting is
+    emergency/auto-taken by any available pawn regardless of orders,
+    which is *why* there's no vanilla "put out fire" float menu option
+    to begin with. So the fix isn't "add a fire-fighting sweep option" -
+    it's bailing out of the whole click when there's an active `Fire`
+    thing on the cell (`Build()` in `FloatMenuPatch`, checked right after
+    `thingsHere` is built), since nothing this mod offers makes sense to
+    send pawns into a burning tile for. Also added a general
+    `directOrderable` check to `IsSweepEligible` - respecting that flag
+    is more robust than denylisting every non-orderable def we happen to
+    trip over (see the `CookFillHopper` bullet below for the ad-hoc
+    version of that problem).
+- **Fixed: right-clicking a plant already marked for harvest/cut/chop did
+  nothing.** `PlantsCut` (cutting/chopping) is `workType PlantCutting` -
+  a completely separate `WorkTypeDef` from `Growing`, and was missing
+  from `SupportedWorkTypeDefNames` entirely. Added.
+- **Empty farm cell doing nothing: confirmed not a mod bug**, not just
+  assumed - pulled the actual decompiled `WorkGiver_GrowerSow` source
+  (public RW-Decompile repos) rather than continuing to guess. In order,
+  `JobOnCell`/`HasJobOnCell` requires: the cell resolves to a
+  `Zone_Growing` (confirmed already true here) **with `allowSow` checked
+  on the zone** - a separate toggle from just being a growing zone, and
+  the one most likely culprit; a plant type the zone can actually
+  calculate for that cell (`CalculateWantedPlantDef` non-null);
+  `PlantUtility.GrowthSeasonNow` true (season/temperature); and the cell
+  clear of any blocking plant/blueprint/frame that isn't already
+  reservable. Any of these failing is vanilla behaving exactly as
+  designed - same code path the base game's own AI uses. Nothing to fix
+  in this mod; next step if it's still not working is checking the
+  zone's "Allow Sow" checkbox specifically.
 - Achtung is not part of this user's modlist - deprioritized as a
   compatibility target, see the section 4 bullet. User's actual modlist
   includes **Pick Up And Haul** (Workshop ID 1279012058) - relevant any
@@ -172,7 +222,7 @@ A RimWorld 1.5 mod that adds area-sweep task commands to the right-click context
 - Mining: one pawn per cell. Sweep assigns each pawn to a separate unreserved minable cell within radius.
 - Cleaning/other: one pawn per cell. Same as mining - fan out to distinct unreserved cells.
 
-**Need interrupts:** A tick-level check monitors hunger, recreation, and sleep. When any drops to 5% or below, the pawn's forced job is cleared and they path to satisfy that need. They do NOT return to the sweep automatically afterward (this prevents infinite loops and lets the player re-issue if desired).
+**Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick.
 
 ## 3. Technical Architecture
 

@@ -12,18 +12,22 @@ namespace DoNotBeLazy.Components
     // SharedPool is the live, shared candidate list for the whole sweep -
     // every pawn in the same sweep call (BeginSweep) points at the same
     // List instance, so claiming a target for one pawn removes it for
-    // everyone else. Workstation orders get an empty pool since bill
-    // continuation is handled entirely by JobTrackerPatch re-asking the
-    // scanner for the same bill giver - see Notify_JobEnded below.
+    // everyone else. Workstation orders get an empty pool - bill
+    // continuation while it's the same bill happens entirely in
+    // JobTrackerPatch re-asking the scanner for the same bill giver, but
+    // WorkstationTarget is still needed here to resume that same station
+    // after a need-pause (see AssignNextTask).
     public class SweepOrder
     {
         public WorkGiverDef WorkGiverDef { get; }
         public List<LocalTargetInfo> SharedPool { get; }
+        public Thing WorkstationTarget { get; }
 
-        public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool)
+        public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
+            WorkstationTarget = workstationTarget;
         }
     }
 
@@ -35,6 +39,13 @@ namespace DoNotBeLazy.Components
     // else observes: a pawn going down, dying, drafting, or leaving the
     // map mid-sweep (architecture doc section 4 edge cases).
     //
+    // Need interrupts pause rather than cancel (per explicit user request -
+    // this reverses the original "don't auto-resume" design): NeedMonitor
+    // calls PauseForNeed instead of RemoveSweep, and Notify_JobEnded checks
+    // pausedForNeed first, so once the pawn's own eat/sleep/joy job wraps up
+    // they're handed the next sweep task (or, for a workstation order, sent
+    // back to the same station) automatically.
+    //
     // No ExposeData - per architecture doc 4, sweeps are cleared on
     // load rather than persisted. Simplest option for v1 and avoids
     // re-deriving stale reservations against a changed map state.
@@ -43,6 +54,12 @@ namespace DoNotBeLazy.Components
         private const int StateCheckIntervalTicks = 60;
 
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
+
+        // pawns pulled out of their sweep job for a critical need but still
+        // tracked in activeSweeps - NeedMonitor adds them here via
+        // PauseForNeed instead of RemoveSweep, so the sweep can resume once
+        // whatever job vanilla AI gives them (eat/sleep/joy) ends on its own
+        private readonly HashSet<Pawn> pausedForNeed = new HashSet<Pawn>();
 
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
@@ -103,6 +120,45 @@ namespace DoNotBeLazy.Components
         public void RemoveSweep(Pawn pawn)
         {
             activeSweeps.Remove(pawn);
+            pausedForNeed.Remove(pawn);
+        }
+
+        public bool IsPaused(Pawn pawn)
+        {
+            return pausedForNeed.Contains(pawn);
+        }
+
+        // Called by NeedMonitor when a swept pawn's need goes critical.
+        // Keeps the sweep order alive (does NOT RemoveSweep) so
+        // Notify_JobEnded can resume it once the pawn's own need-driven job
+        // (eat/sleep/joy, picked by vanilla AI once we let go) finishes on
+        // its own. Uses the same self-caused-job-end suppression as
+        // GiveJob - without it, this EndCurrentJob call would trip
+        // JobTrackerPatch's postfix immediately and read as "sweep task
+        // ended", removing the sweep before the pawn even gets to eat.
+        public void PauseForNeed(Pawn pawn)
+        {
+            if (!activeSweeps.ContainsKey(pawn))
+            {
+                return;
+            }
+
+            pausedForNeed.Add(pawn);
+
+            if (pawn.jobs?.curJob == null)
+            {
+                return;
+            }
+
+            AssigningJob = true;
+            try
+            {
+                pawn.jobs.EndCurrentJob(JobCondition.InterruptForced);
+            }
+            finally
+            {
+                AssigningJob = false;
+            }
         }
 
         // Entry point from FloatMenuPatch. eligible pawns only - caller has
@@ -155,9 +211,12 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
-                // empty pool - see SweepOrder comment, this is just enough state
-                // for TryGetActiveSweep to gate the JobTrackerPatch continuation
-                activeSweeps[pawn] = new SweepOrder(workGiverDef, new List<LocalTargetInfo>());
+                // empty pool - see SweepOrder comment. billGiver is kept so
+                // AssignNextTask can re-ask this same station after a
+                // need-pause; a fresh assignment always clears any leftover
+                // pause state from a previous order
+                pausedForNeed.Remove(pawn);
+                activeSweeps[pawn] = new SweepOrder(workGiverDef, new List<LocalTargetInfo>(), billGiver);
                 GiveJob(pawn, job);
                 return;
             }
@@ -227,6 +286,7 @@ namespace DoNotBeLazy.Components
                 {
                     break;
                 }
+                pausedForNeed.Remove(pawn);
                 activeSweeps[pawn] = order;
                 AssignNextTask(pawn, order);
             }
@@ -236,6 +296,17 @@ namespace DoNotBeLazy.Components
         {
             if (!activeSweeps.TryGetValue(pawn, out SweepOrder order))
             {
+                return;
+            }
+
+            if (pausedForNeed.Remove(pawn))
+            {
+                // this wasn't a sweep task ending - it's the pawn's own
+                // need-driven job (eat/sleep/joy) wrapping up on its own.
+                // Resume regardless of how it ended (succeeded, or
+                // interrupted by something else entirely) - if they're free
+                // again, they go back to the last-ordered work.
+                AssignNextTask(pawn, order);
                 return;
             }
 
@@ -265,6 +336,27 @@ namespace DoNotBeLazy.Components
             if (!PawnValidator.CanSweep(pawn, order.WorkGiverDef) || !pawn.Spawned || pawn.Map != map)
             {
                 RemoveSweep(pawn);
+                return;
+            }
+
+            if (order.WorkstationTarget != null)
+            {
+                // resuming (or continuing) a workstation order - always the
+                // same station, never a pool to draw from
+                if (order.WorkstationTarget.Destroyed)
+                {
+                    RemoveSweep(pawn);
+                    return;
+                }
+
+                Job resumeJob = scanner.JobOnThing(pawn, order.WorkstationTarget);
+                if (resumeJob == null)
+                {
+                    RemoveSweep(pawn);
+                    return;
+                }
+
+                GiveJob(pawn, resumeJob);
                 return;
             }
 
