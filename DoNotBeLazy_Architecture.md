@@ -100,14 +100,33 @@ diff against memory:
   for actual testing/use. A static check was run against the real
   Achtung 1.5 DLL anyway (see section 4) and turned up nothing blocking;
   left as reference only in case the mod is shared more broadly later.
+- **Cell-scanned WorkGivers now supported (fixed 2026-08-15).** Reported
+  as a bug: right-clicking an empty crop-zone cell produced no `* Sow`.
+  Root cause: `GrowerSow` is `scanCells=true, scanThings=false` - the
+  target IS the empty cell, and the mod's whole pipeline (`FloatMenuPatch`,
+  `TaskScanner`, `SweepManager`) was built entirely around `Thing`
+  targets. Fixed generically (not special-cased to sowing), so this
+  should also cover any other `scanCells`-only WorkGiver (e.g. clear
+  snow), not just `GrowerSow`. `Growing` was also added to
+  `SupportedWorkTypeDefNames`, since sowing wasn't in that list at all
+  before. See `TaskScanner.ScanCells` and `FloatMenuPatch.FindTargetWithJob`
+  in section 3.2.
+- **`CookFillHopper` excluded (fixed 2026-08-15).** Reported as a bug:
+  right-clicking food or drugs produced a confusing `* fill food hoppers`
+  option. Root cause: `CookFillHopper` is `workType Hauling`, so it was
+  swept up by the broad Hauling inclusion, and its `HasJobOnThing` legitimately
+  returns true for food items that could refuel a nearby hopper - not a
+  crash or a logic error, just noise nobody wants when trying to eat or
+  take a drug. Added a small `ExcludedDefNames` denylist in
+  `FloatMenuPatch` rather than narrowing the whole Hauling category;
+  revisit if more of these turn up.
 - Known open items, not yet closed: `showSweepOverlay` setting has no
   code behind it (section 3.4); `JobTrackerPatch`'s bill-continuation
   branch doesn't verify the ended job's target is the sweep's own bill
-  giver (low risk, documented assumption); WorkGivers that only
-  `scanCells` (e.g. clear-snow) never produce a sweep option; multiple
-  WorkGiverDefs covering one activity (e.g. construction's
-  deliver-resources vs finish-frame givers) can produce more than one
-  `*` entry for the same click - menu-noise question, not a bug.
+  giver (low risk, documented assumption); multiple WorkGiverDefs
+  covering one activity (e.g. construction's deliver-resources vs
+  finish-frame givers) can produce more than one `*` entry for the same
+  click - menu-noise question, not a bug.
 
 ## 1. Intent
 
@@ -173,13 +192,13 @@ The postfix body is wrapped in a try/catch that logs and swallows: an exception 
 
 Rather than cloning existing `FloatMenuOption` entries (they don't expose the `WorkGiverDef` that produced them, so there's nothing to key a sweep off), the postfix independently walks `DefDatabase<WorkGiverDef>.AllDefsListForReading`, filters to sweep-eligible defs (see below), converts `clickPos` to a cell, and for each eligible def checks whether any selected pawn has `HasJobOnThing` true against a thing at that cell - the same predicate vanilla itself uses to decide whether to show the normal option. If so, it appends one `* <label>` `FloatMenuOption` whose action calls `SweepManager.BeginSweep(eligiblePawns, target, workGiverDef)`.
 
-Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, or `Mining`.
+Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, `Mining`, or `Growing` - minus a small `ExcludedDefNames` denylist (currently just `CookFillHopper`, see the status-section bullet above) for specific defs that technically match but produce confusing options nobody wants. Target detection (`FindTargetWithJob`) branches on `def.scanCells` vs `def.scanThings`: cell-scanned defs (`GrowerSow`) check `HasJobOnCell` against the clicked cell directly, so they work even when nothing is on that cell - which is the normal case for an empty tile waiting to be sown.
 
 **Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Eat meal`, `* Smoke smokeleaf joint` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
 
 Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based sweeps) - you can manually order a drafted pawn to eat or take a combat drug in vanilla, and dosing a raiding party before a fight is a real use case. Also does not gate on hunger level - a manual order works regardless of current need, matching vanilla's manual-order semantics. If the stack doesn't have enough for everyone, later pawns in the loop may fail to get their dose once the stack runs empty from under them - not handled specially, since vanilla's own job system already has to tolerate pawns racing for the same food and fails harmlessly rather than crashing.
 
-**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below).
+**SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetStillValid` checks cell bounds/area/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case.
 
 Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool.
 
@@ -191,9 +210,12 @@ No `ExposeData()` on `SweepManager` - sweeps are cleared on load, matching the "
 
 **NeedMonitor.cs** - A `GameComponent` that runs a tick check (every 60 ticks for performance) on all pawns with active sweeps. If hunger, recreation, or sleep is at or below 5% (`need.CurLevelPercentage <= 0.05f`), it clears the pawn's sweep from `SweepManager` and ends their current forced job so the AI takes over for need satisfaction.
 
-**TaskScanner.cs** - Static utility. Given a cell, radius, map, `WorkGiverDef`, and a driving pawn, returns a `List<LocalTargetInfo>` of matching incomplete tasks. Implemented as `scanner.PotentialWorkThingsGlobal(forPawn)` filtered by squared-distance-from-center, forbidden, allowed area, `CanReserve`, and `HasJobOnThing` - not `GenRadial.RadialCellsAround()` as originally planned, since the WorkGiver API is already thing-scoped and iterating things directly avoids an 800-cell scan.
+**TaskScanner.cs** - Static utility. Given a cell, radius, map, `WorkGiverDef`, and a driving pawn, returns a `List<LocalTargetInfo>` of matching incomplete tasks, via two independent branches (a def can be either or both):
 
-`PotentialWorkThingsGlobal` returns **null** on `WorkGiver_Scanner` itself and most WorkGivers never override it (construction and `WorkGiver_DoBill` included), so the scanner falls back to `map.listerThings.ThingsMatching(scanner.PotentialWorkThingRequest)` for `scanThings` givers, guarding against an undefined `ThingRequest` (which `ThingsMatching` throws on). This mirrors what vanilla's `JobGiver_Work` does. Cell-scanned (`scanCells`) givers such as clear-snow find nothing and simply offer no sweep. Filters out tasks already claimed by another pawn via the normal reservation system (no sweep-specific claim tracking needed).
+- `ScanThings` (for `scanThings` defs): `scanner.PotentialWorkThingsGlobal(forPawn)` filtered by squared-distance-from-center, forbidden, allowed area, `CanReserve`, and `HasJobOnThing`. `PotentialWorkThingsGlobal` returns **null** on `WorkGiver_Scanner` itself and most WorkGivers never override it (construction and `WorkGiver_DoBill` included), so this falls back to `map.listerThings.ThingsMatching(scanner.PotentialWorkThingRequest)`, guarding against an undefined `ThingRequest` (which `ThingsMatching` throws on) - mirrors what vanilla's `JobGiver_Work` does.
+- `ScanCells` (for `scanCells` defs, added 2026-08-15 to fix the missing-Sow bug): `GenRadial.RadialCellsAround(center, radius, true)` - the `GenRadial` approach originally planned for everything, kept for just this branch since there's no thing-lister equivalent for "empty cells that could be sown." Filtered by bounds, allowed area, `CanReserve`, and `HasJobOnCell`.
+
+Filters out tasks already claimed by another pawn via the normal reservation system (no sweep-specific claim tracking needed).
 
 **PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity.
 

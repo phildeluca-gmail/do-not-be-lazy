@@ -282,7 +282,7 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
-                Job job = scanner.JobOnThing(pawn, target.Thing);
+                Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing) : scanner.JobOnCell(pawn, target.Cell);
                 if (job == null)
                 {
                     continue;
@@ -298,25 +298,41 @@ namespace DoNotBeLazy.Components
 
         private bool TargetStillValid(Pawn pawn, LocalTargetInfo target)
         {
-            Thing thing = target.Thing;
-            if (thing == null || thing.Destroyed || thing.Map != map)
-            {
-                return false;
-            }
-            if (thing.IsForbidden(pawn))
-            {
-                return false;
-            }
-
             // pool was built against one driver pawn's allowed area - the
             // rest of the group can have different zones, so re-check here
             Area allowed = pawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
-            if (allowed != null && !allowed[thing.Position])
+
+            if (target.HasThing)
+            {
+                Thing thing = target.Thing;
+                if (thing == null || thing.Destroyed || thing.Map != map)
+                {
+                    return false;
+                }
+                if (thing.IsForbidden(pawn))
+                {
+                    return false;
+                }
+                if (allowed != null && !allowed[thing.Position])
+                {
+                    return false;
+                }
+                return map.reservationManager.CanReserve(pawn, thing);
+            }
+
+            // cell target (e.g. an empty tile waiting to be sown) - no
+            // Thing to check Destroyed/forbidden on, just bounds + area +
+            // reservation
+            IntVec3 cell = target.Cell;
+            if (!cell.InBounds(map))
             {
                 return false;
             }
-
-            return map.reservationManager.CanReserve(pawn, thing);
+            if (allowed != null && !allowed[cell])
+            {
+                return false;
+            }
+            return map.reservationManager.CanReserve(pawn, target);
         }
 
         private static int NearestTargetIndex(IntVec3 from, List<LocalTargetInfo> pool)

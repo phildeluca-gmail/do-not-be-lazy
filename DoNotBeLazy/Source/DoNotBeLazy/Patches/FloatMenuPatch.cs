@@ -33,17 +33,28 @@ namespace DoNotBeLazy.Patches
     // (they don't carry one anywhere accessible).
     public static class FloatMenuPatch
     {
-        // Hauling/Construction/Cleaning/Mining per architecture doc section
-        // 2's examples. Workstation bills aren't listed by name here - any
-        // WorkGiverDef whose Worker is WorkGiver_DoBill qualifies regardless
-        // of WorkTypeDef, since there's one per crafting station and
-        // hardcoding them all would break against mod/DLC additions.
+        // Hauling/Construction/Cleaning/Mining/Growing per architecture doc
+        // section 2's examples. Workstation bills aren't listed by name here
+        // - any WorkGiverDef whose Worker is WorkGiver_DoBill qualifies
+        // regardless of WorkTypeDef, since there's one per crafting station
+        // and hardcoding them all would break against mod/DLC additions.
         private static readonly HashSet<string> SupportedWorkTypeDefNames = new HashSet<string>
         {
             "Hauling",
             "Construction",
             "Cleaning",
             "Mining",
+            "Growing",
+        };
+
+        // CookFillHopper (workType Hauling, vanilla defName) matches on any
+        // food item near a hopper that needs fuel - right-clicking food or
+        // drugs was offering "* fill food hoppers", an obscure mechanic
+        // nobody was asking for in that context. Everything else under
+        // Hauling is still fine; this one def just doesn't belong.
+        private static readonly HashSet<string> ExcludedDefNames = new HashSet<string>
+        {
+            "CookFillHopper",
         };
 
         // Built once on first right-click instead of walking the whole
@@ -120,11 +131,10 @@ namespace DoNotBeLazy.Patches
                 return;
             }
 
+            // not early-returning when this is empty - scanCells defs (sow
+            // crops) target the clicked cell itself, which is normally
+            // empty by definition
             List<Thing> thingsHere = cell.GetThingList(map);
-            if (thingsHere.Count == 0)
-            {
-                return;
-            }
 
             foreach (WorkGiverDef def in EligibleDefs())
             {
@@ -135,8 +145,8 @@ namespace DoNotBeLazy.Patches
                 }
 
                 var scanner = (WorkGiver_Scanner)def.Worker;
-                Thing target = FindThingWithJob(eligiblePawns, scanner, thingsHere);
-                if (target == null)
+                LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere);
+                if (!target.IsValid)
                 {
                     continue;
                 }
@@ -144,7 +154,7 @@ namespace DoNotBeLazy.Patches
                 string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
 
                 WorkGiverDef capturedDef = def;
-                Thing capturedTarget = target;
+                LocalTargetInfo capturedTarget = target;
                 Map capturedMap = map;
                 options.Add(new FloatMenuOption(
                     "* " + label,
@@ -281,7 +291,11 @@ namespace DoNotBeLazy.Patches
 
         private static bool IsSweepEligible(WorkGiverDef def)
         {
-            if (!(def?.Worker is WorkGiver_Scanner scanner))
+            if (def == null || ExcludedDefNames.Contains(def.defName))
+            {
+                return false;
+            }
+            if (!(def.Worker is WorkGiver_Scanner scanner))
             {
                 return false;
             }
@@ -293,21 +307,22 @@ namespace DoNotBeLazy.Patches
         }
 
         // vanilla only shows the base option when some selected pawn can
-        // actually do the job on the clicked thing - mirror that here so
-        // the * option only shows up where the normal one would have
-        private static Thing FindThingWithJob(List<Pawn> pawns, WorkGiver_Scanner scanner, List<Thing> thingsHere)
+        // actually do the job on the clicked target - mirror that here so
+        // the * option only shows up where the normal one would have.
+        // scanCells defs (e.g. GrowerSow - sow crops) have no Thing to
+        // check: the target IS the clicked cell itself, empty or not, so
+        // that branch runs regardless of what's in thingsHere.
+        private static LocalTargetInfo FindTargetWithJob(List<Pawn> pawns, WorkGiverDef def, WorkGiver_Scanner scanner, IntVec3 cell, List<Thing> thingsHere)
         {
-            foreach (Thing thing in thingsHere)
+            if (def.scanCells)
             {
                 foreach (Pawn pawn in pawns)
                 {
-                    // HasJobOnThing on a modded scanner can throw on odd
-                    // targets - one bad def shouldn't eat the menu
                     try
                     {
-                        if (scanner.HasJobOnThing(pawn, thing))
+                        if (scanner.HasJobOnCell(pawn, cell))
                         {
-                            return thing;
+                            return cell;
                         }
                     }
                     catch
@@ -316,7 +331,31 @@ namespace DoNotBeLazy.Patches
                     }
                 }
             }
-            return null;
+
+            if (def.scanThings)
+            {
+                foreach (Thing thing in thingsHere)
+                {
+                    foreach (Pawn pawn in pawns)
+                    {
+                        // HasJobOnThing on a modded scanner can throw on odd
+                        // targets - one bad def shouldn't eat the menu
+                        try
+                        {
+                            if (scanner.HasJobOnThing(pawn, thing))
+                            {
+                                return thing;
+                            }
+                        }
+                        catch
+                        {
+                            // swallow
+                        }
+                    }
+                }
+            }
+
+            return LocalTargetInfo.Invalid;
         }
 
         private static List<Pawn> EligiblePawns(List<Pawn> pawns, Map map, WorkGiverDef def)
