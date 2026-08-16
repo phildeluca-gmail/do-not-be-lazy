@@ -1,4 +1,4 @@
-<!-- Updated: 2026-08-15 EDT - Phase 3 complete, build green -->
+<!-- Updated: 2026-08-15 EDT - in-game testing underway, Consume added -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
@@ -6,8 +6,41 @@
 
 Phases 1-3 are implemented, an Opus compatibility/correctness pass has
 been run over the Phase 3 files, and the project builds clean (`dotnet
-build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). Not yet
-tested in a running game - see Phase 4 in section 5.2.
+build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
+mod is now being tested in an actual running game (not just statically
+verified) - see below for what's come out of that so far.
+
+**From in-game testing (2026-08-15):**
+- Achtung is not part of this user's modlist - deprioritized as a
+  compatibility target, see the section 4 bullet.
+- Reported "pawns not all going to a large stack, and the consume
+  context menu seems disabled" turned out to be two separate things
+  once clarified:
+  - The "consume" menu (eating food, smoking, snorting drugs) was never
+    covered by this mod at all - it's not WorkGiver-based, so it was
+    architecturally out of reach of the whole sweep system. **New
+    feature added**: `* <verb> <item>` (e.g. `* Eat meal`, `* Smoke
+    smokeleaf joint`) now appears when an ingestible thing is clicked,
+    and orders every eligible selected pawn to take one dose/meal each,
+    fired off immediately (not tracked as an ongoing sweep - there's
+    nothing to chain, the job either succeeds or it doesn't). See
+    `FloatMenuPatch.AddConsumeOption` in section 3.2.
+  - No specific bug found in the sweep mechanism itself from this report.
+- Reported "wood can't be collected, space existed for it" - confirmed
+  **not a mod bug**: right-clicking the wood directly showed neither the
+  vanilla `Haul` option nor our `* Haul`, and `FloatMenuPatch` only ever
+  offers a sweep where the normal action would already be valid. If
+  vanilla itself has no haul job here, `HasJobOnThing` is correctly
+  returning false - almost always means no stockpile zone in reach is
+  actually accepting Wood (filter, fullness, or forbidden status), not
+  something this mod controls.
+- Mood now has its own separate interrupt threshold (`moodThreshold`,
+  default 10%, its own slider) rather than sharing `needThreshold` - see
+  section 3.4. Ending the forced job (already the existing behavior) is
+  sufficient to make a pawn address hunger/rest/joy on their own via
+  vanilla's think tree - no explicit "go do X" job-issuing was needed or
+  added. Mood has no single fix-it job in vanilla; releasing the pawn to
+  their normal AI is the only lever available there too.
 
 Files that exist and their state:
 - Phase 1: `DoNotBeLazyMod.cs`, `Logger.cs`, `About.xml`, `.csproj` - done.
@@ -63,11 +96,10 @@ diff against memory:
   fixes (cached eligible-WorkGiverDef list, map derived from the first
   *spawned* pawn since caravan/world pawns have null `Map`). Full detail
   is folded into the relevant component descriptions in 3.2.
-- **Static Achtung compatibility check run against the actual installed
-  Achtung 1.5 DLL** (not guessed) - see the Achtung bullet in section 4.
-  One item remains open: Achtung's transpiler on `EndCurrentJob` hasn't
-  been tested in a running game together with our patch on the same
-  method.
+- **Achtung is not in this user's modlist** - not a compatibility target
+  for actual testing/use. A static check was run against the real
+  Achtung 1.5 DLL anyway (see section 4) and turned up nothing blocking;
+  left as reference only in case the mod is shared more broadly later.
 - Known open items, not yet closed: `showSweepOverlay` setting has no
   code behind it (section 3.4); `JobTrackerPatch`'s bill-continuation
   branch doesn't verify the ended job's target is the sweep's own bill
@@ -143,6 +175,10 @@ Rather than cloning existing `FloatMenuOption` entries (they don't expose the `W
 
 Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, or `Mining`.
 
+**Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Eat meal`, `* Smoke smokeleaf joint` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
+
+Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based sweeps) - you can manually order a drafted pawn to eat or take a combat drug in vanilla, and dosing a raiding party before a fight is a real use case. Also does not gate on hunger level - a manual order works regardless of current need, matching vanilla's manual-order semantics. If the stack doesn't have enough for everyone, later pawns in the loop may fail to get their dose once the stack runs empty from under them - not handled specially, since vanilla's own job system already has to tolerate pawns racing for the same food and fails harmlessly rather than crashing.
+
 **SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below).
 
 Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool.
@@ -175,12 +211,13 @@ No `ExposeData()` on `SweepManager` - sweeps are cleared on load, matching the "
 ### 3.4 Settings (ModSettings)
 
 - `sweepRadius` - int, default 16, configurable 1-50
-- `needThreshold` - float, default 0.05 (5%), configurable 0.01-0.20
+- `needThreshold` - float, default 0.05 (5%), configurable 0.01-0.20 - covers hunger/recreation/rest
+- `moodThreshold` - float, default 0.10 (10%), configurable 0.01-0.30 - separate slider, mood specifically (added 2026-08-15 per user request; mood dropping to 5% is already close to a mental break, so it gets its own, higher default)
 - `showSweepOverlay` - bool, default true (highlight radius on hover) - **setting exists but nothing reads it yet**; no overlay-drawing code has been written. Not in the Phase 1-3 plan as a separate task, so it fell out of scope. Needs a task added (likely a `MapComponent.MapComponentOnGUI()` or `MapComponent.MapComponentUpdate()` override) before this setting does anything.
 
 ## 4. Edge Cases and Risks
 
-- **Achtung! compatibility:** Checked against the actual installed Achtung 1.5 DLL (`Achtung.dll`, reflected directly rather than guessed) at `E:\SteamLibrary\steamapps\workshop\content\294100\730936602\1.5\Assemblies\`. Findings:
+- **Achtung! compatibility:** **Not part of this user's actual modlist** - deprioritized, not a blocker for testing or release to this save. Left in as a static check only, in case the mod is shared more broadly later. Checked against the actual installed Achtung 1.5 DLL (`Achtung.dll`, reflected directly rather than guessed) at `E:\SteamLibrary\steamapps\workshop\content\294100\730936602\1.5\Assemblies\`. Findings:
   - `ChoicesAtForMultiSelect` (our 2+ pawn path): Achtung does not touch this method at all. No overlap.
   - `ChoicesAtFor` (our single-pawn path): Achtung postfixes it too (`FloatMenuMakerMap_ChoicesAtFor_Postfix`, appends its own options to the same `__result` list). Two postfixes stacking on one method is standard, low-risk Harmony usage - should compose fine regardless of load order since neither replaces the list, only appends to it.
   - `Pawn_JobTracker.EndCurrentJob` (our `JobTrackerPatch.cs`): Achtung applies a **Prefix, Postfix, AND a Transpiler** here. The transpiler is the one real unknown - it rewrites the method's IL, which is a deeper interaction than pre/postfix stacking. Our prefix (captures `curJob` before the body clears it) should still fire before whatever transpiled body runs, so it's likely fine, but this can't be fully confirmed by static analysis alone - **needs an actual in-game test with Achtung loaded** before calling this solid. Everything else here is verified; this is the one open item.

@@ -4,6 +4,7 @@ using HarmonyLib;
 using RimWorld;
 using UnityEngine;
 using Verse;
+using Verse.AI;
 using DoNotBeLazy.Components;
 using DoNotBeLazy.Utility;
 // UnityEngine has its own Logger and this file needs UnityEngine for Vector3
@@ -158,6 +159,95 @@ namespace DoNotBeLazy.Patches
                         mgr.BeginSweep(eligiblePawns, capturedTarget, capturedDef);
                     },
                     MenuOptionPriority.Low));
+            }
+
+            AddConsumeOption(pawns, map, thingsHere, options);
+        }
+
+        // Eating/drugs aren't WorkGiver-based at all - there's no WorkGiverDef
+        // for "ingest", it's a separate system (JobDefOf.Ingest), so this
+        // doesn't go through SweepManager or the eligibleDefs loop above.
+        // One dose/meal per eligible pawn, issued directly and immediately -
+        // not an ongoing sweep. Mirrors what right-clicking "Eat/Smoke/Snort
+        // X" does for a single pawn in vanilla, just fanned out to the whole
+        // selection. Deliberately ignores Drafted (you can manually order a
+        // drafted pawn to eat/take a combat drug in vanilla too) and doesn't
+        // check hunger level (a manual order works regardless of need, same
+        // as vanilla).
+        private static void AddConsumeOption(List<Pawn> pawns, Map map, List<Thing> thingsHere, List<FloatMenuOption> options)
+        {
+            Thing ingestible = FindIngestibleThing(thingsHere);
+            if (ingestible == null)
+            {
+                return;
+            }
+
+            var canEat = new List<Pawn>();
+            foreach (Pawn pawn in pawns)
+            {
+                if (pawn != null && pawn.Map == map && CanConsume(pawn, ingestible))
+                {
+                    canEat.Add(pawn);
+                }
+            }
+            if (canEat.Count == 0)
+            {
+                return;
+            }
+
+            string commandFormat = ingestible.def.ingestible.ingestCommandString;
+            string label = commandFormat.NullOrEmpty()
+                ? "Consume " + ingestible.LabelShort
+                : string.Format(commandFormat, ingestible.LabelShort);
+
+            Thing capturedThing = ingestible;
+            options.Add(new FloatMenuOption(
+                "* " + label,
+                () => ConsumeAll(canEat, capturedThing),
+                MenuOptionPriority.Low));
+        }
+
+        private static Thing FindIngestibleThing(List<Thing> thingsHere)
+        {
+            foreach (Thing thing in thingsHere)
+            {
+                if (thing?.def?.ingestible != null && thing.def.ingestible.showIngestFloatOption)
+                {
+                    return thing;
+                }
+            }
+            return null;
+        }
+
+        private static bool CanConsume(Pawn pawn, Thing thing)
+        {
+            if (pawn.Dead || pawn.Downed || pawn.InMentalState)
+            {
+                return false;
+            }
+            if (pawn.RaceProps == null || !pawn.RaceProps.Humanlike)
+            {
+                return false;
+            }
+            return FoodUtility.WillEat(pawn, thing, pawn);
+        }
+
+        // one dose each, taken directly from the clicked stack - not looped
+        // like an area sweep, and not tracked by SweepManager (nothing to
+        // interrupt or chain, the job either succeeds or it doesn't)
+        private static void ConsumeAll(List<Pawn> pawns, Thing thing)
+        {
+            foreach (Pawn pawn in pawns)
+            {
+                if (thing.Destroyed || thing.stackCount <= 0)
+                {
+                    break;
+                }
+
+                float nutrition = thing.GetStatValue(StatDefOf.Nutrition);
+                Job job = JobMaker.MakeJob(JobDefOf.Ingest, thing);
+                job.count = Mathf.Clamp(FoodUtility.WillIngestStackCountOf(pawn, thing.def, nutrition), 1, thing.stackCount);
+                pawn.jobs.TryTakeOrderedJob(job, JobTag.Misc);
             }
         }
 

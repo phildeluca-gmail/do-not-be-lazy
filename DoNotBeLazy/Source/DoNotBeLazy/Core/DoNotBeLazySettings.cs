@@ -9,6 +9,7 @@ namespace DoNotBeLazy.Core
     {
         public int sweepRadius = 16;
         public float needThreshold = 0.05f;
+        public float moodThreshold = 0.10f;
         public bool showSweepOverlay = true;
 
         public override void ExposeData()
@@ -16,6 +17,7 @@ namespace DoNotBeLazy.Core
             base.ExposeData();
             Scribe_Values.Look(ref sweepRadius, "sweepRadius", 16);
             Scribe_Values.Look(ref needThreshold, "needThreshold", 0.05f);
+            Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
         }
 
@@ -30,6 +32,10 @@ namespace DoNotBeLazy.Core
             listing.Gap();
             listing.Label($"Need interrupt threshold: {needThreshold:P0}");
             needThreshold = listing.Slider(needThreshold, 0.01f, 0.20f);
+
+            listing.Gap();
+            listing.Label($"Mood interrupt threshold: {moodThreshold:P0}");
+            moodThreshold = listing.Slider(moodThreshold, 0.01f, 0.30f);
 
             listing.Gap();
             listing.CheckboxLabeled("Show sweep radius overlay on hover", ref showSweepOverlay);

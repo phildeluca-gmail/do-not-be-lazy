@@ -6,12 +6,18 @@ using DoNotBeLazy.Core;
 namespace DoNotBeLazy.Components
 {
     // GameComponent: every 60 ticks, checks pawns currently in an active
-    // sweep for critical needs (hunger, recreation, sleep). If any need is
-    // at or below DoNotBeLazySettings.needThreshold, the pawn's sweep is
-    // cancelled and their forced job is ended so vanilla AI takes over.
-    // Per the architecture doc, they do NOT rejoin the sweep automatically
-    // afterward - this avoids interrupt loops; the player re-issues if
-    // wanted.
+    // sweep for critical needs (hunger, recreation, sleep - vs needThreshold;
+    // mood has its own separate moodThreshold, since 5% mood is basically a
+    // mental break already and the player asked for a higher default there).
+    // If any is critical, the pawn's sweep is cancelled and their forced job
+    // is ended so vanilla AI takes over. Per the architecture doc, they do
+    // NOT rejoin the sweep automatically afterward - this avoids interrupt
+    // loops; the player re-issues if wanted. Ending the forced job is enough
+    // on its own - EndCurrentJob defaults to startNewJob:true, so the pawn's
+    // normal think tree picks a new job immediately, which for hunger/rest/
+    // joy already means "go address it" without us issuing anything
+    // explicit. Mood doesn't have a single fix-it job in vanilla; letting
+    // the think tree take over is the only lever there too.
     //
     // RimWorld auto-instantiates every non-abstract GameComponent subclass
     // with a (Game) constructor when a game is created/loaded, so this
@@ -38,6 +44,7 @@ namespace DoNotBeLazy.Components
             }
 
             float threshold = DoNotBeLazyMod.Settings.needThreshold;
+            float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold;
 
             foreach (Map map in Find.Maps)
             {
@@ -49,7 +56,7 @@ namespace DoNotBeLazy.Components
 
                 foreach (Pawn pawn in sweepManager.GetSweptPawns())
                 {
-                    if (!NeedIsCritical(pawn, threshold))
+                    if (!NeedIsCritical(pawn, threshold, moodThreshold))
                     {
                         continue;
                     }
@@ -66,11 +73,12 @@ namespace DoNotBeLazy.Components
             }
         }
 
-        private static bool NeedIsCritical(Pawn pawn, float threshold)
+        private static bool NeedIsCritical(Pawn pawn, float threshold, float moodThreshold)
         {
             return NeedIsCritical(pawn.needs?.food, threshold)
                 || NeedIsCritical(pawn.needs?.joy, threshold)
-                || NeedIsCritical(pawn.needs?.rest, threshold);
+                || NeedIsCritical(pawn.needs?.rest, threshold)
+                || NeedIsCritical(pawn.needs?.mood, moodThreshold);
         }
 
         private static bool NeedIsCritical(Need need, float threshold)
