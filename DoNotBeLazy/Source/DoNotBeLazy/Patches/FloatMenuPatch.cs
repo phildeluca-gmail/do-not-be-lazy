@@ -239,6 +239,21 @@ namespace DoNotBeLazy.Patches
             {
                 return false;
             }
+
+            // WillEat is a food-appetite check (preferability/nutrition) and
+            // rejects pure drugs outright - a smokeleaf joint or wake-up
+            // isn't "food", so every drug was failing this and only
+            // unrelated Hauling-category options were left to show. Route
+            // drugs through their own, much simpler check instead.
+            if (thing.def.ingestible.drugCategory != DrugCategory.None)
+            {
+                // vanilla *does* let you force-feed a Teetotaler a drug (see
+                // the "forced to take drugs" thought - it's allowed, just
+                // gives a mood hit) but skip them here rather than force it
+                bool isTeetotaler = pawn.story?.traits != null && pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1);
+                return !isTeetotaler;
+            }
+
             return FoodUtility.WillEat(pawn, thing, pawn);
         }
 

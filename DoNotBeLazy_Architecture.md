@@ -12,7 +12,27 @@ verified) - see below for what's come out of that so far.
 
 **From in-game testing (2026-08-15):**
 - Achtung is not part of this user's modlist - deprioritized as a
-  compatibility target, see the section 4 bullet.
+  compatibility target, see the section 4 bullet. User's actual modlist
+  includes **Pick Up And Haul** (Workshop ID 1279012058) - relevant any
+  time a Hauling-category oddity shows up, since it adds its own
+  `HaulToInventory` WorkGiverDef (label "stuff things in inventory and
+  haul") alongside vanilla `HaulGeneral`. Confirmed not a bug - it's a
+  legitimate, useful hauling variant (grabs multiple items per trip) and
+  is deliberately left un-excluded.
+- **Fixed: `* Consume` never appeared for drugs (wake-up, smokeleaf,
+  etc.), only unrelated Hauling options showed instead.** Root cause:
+  `FoodUtility.WillEat`, used to gate `CanConsume`, is a food-appetite
+  check (preferability/nutrition-based) and rejects pure drugs outright
+  since they aren't food. `CanConsume` in `FloatMenuPatch` now branches:
+  items with `ingestible.drugCategory != DrugCategory.None` skip
+  `WillEat` entirely and use a much simpler check instead.
+- **Teetotalers are now skipped when assigning `* Consume` for a drug**,
+  per explicit user request. Uses `pawn.story.traits.HasTrait(TraitDefOf.DrugDesire,
+  -1)` (confirmed against the actual trait XML: `DrugDesire` degree -1 =
+  Teetotaler). Vanilla technically *allows* force-feeding a drug to a
+  Teetotaler (there's a dedicated "forced to take drugs" mood thought for
+  it), so this is a deliberate choice to skip rather than force, not a
+  vanilla limitation being worked around.
 - Reported "pawns not all going to a large stack, and the consume
   context menu seems disabled" turned out to be two separate things
   once clarified:
@@ -197,6 +217,8 @@ Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all
 **Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Eat meal`, `* Smoke smokeleaf joint` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
 
 Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based sweeps) - you can manually order a drafted pawn to eat or take a combat drug in vanilla, and dosing a raiding party before a fight is a real use case. Also does not gate on hunger level - a manual order works regardless of current need, matching vanilla's manual-order semantics. If the stack doesn't have enough for everyone, later pawns in the loop may fail to get their dose once the stack runs empty from under them - not handled specially, since vanilla's own job system already has to tolerate pawns racing for the same food and fails harmlessly rather than crashing.
+
+`CanConsume` branches on `thing.def.ingestible.drugCategory` (fixed 2026-08-15): non-drug food goes through `FoodUtility.WillEat` as before, but anything with a real drug category skips `WillEat` entirely (it's a food-appetite check and rejected every drug outright, which was the original bug - no `* Consume` was ever appearing for drugs) and instead only excludes Teetotalers (`pawn.story.traits.HasTrait(TraitDefOf.DrugDesire, -1)`), per explicit user request.
 
 **SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetStillValid` checks cell bounds/area/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case.
 
