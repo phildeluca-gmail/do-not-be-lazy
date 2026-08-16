@@ -81,7 +81,7 @@ namespace DoNotBeLazy.Patches
                 && endedJob.targetA.Thing is Thing billGiver
                 && order.WorkGiverDef?.Worker is WorkGiver_Scanner scanner)
             {
-                Job nextBillJob = scanner.JobOnThing(pawn, billGiver);
+                Job nextBillJob = scanner.JobOnThing(pawn, billGiver, true);
                 if (nextBillJob != null)
                 {
                     SweepManager.GiveJob(pawn, nextBillJob);

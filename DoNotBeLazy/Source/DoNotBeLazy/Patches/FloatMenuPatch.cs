@@ -57,9 +57,24 @@ namespace DoNotBeLazy.Patches
         // drugs was offering "* fill food hoppers", an obscure mechanic
         // nobody was asking for in that context. Everything else under
         // Hauling is still fine; this one def just doesn't belong.
+        //
+        // DeliverResourcesToFrames/Blueprints (workType Hauling) are exact
+        // duplicates of ConstructDeliverResourcesToFrames/Blueprints
+        // (workType Construction) - same giverClass, registered twice so
+        // whichever work priority is higher governs it. Excluding the
+        // Hauling-tagged copies specifically, by defName, rather than
+        // deduping by giverClass generally: giverClass is NOT a safe
+        // uniqueness key across the whole WorkGiverDef set - all ~19
+        // workstation bill types (cooking, smithing, tailoring, art,
+        // stonecutting, everything) share the single giverClass
+        // WorkGiver_DoBill, so a giverClass-based dedup was silently
+        // collapsing every workstation type down to just one. Fixed by
+        // reverting to this narrow, explicit denylist instead.
         private static readonly HashSet<string> ExcludedDefNames = new HashSet<string>
         {
             "CookFillHopper",
+            "DeliverResourcesToFrames",
+            "DeliverResourcesToBlueprints",
         };
 
         // Built once on first right-click instead of walking the whole
@@ -178,7 +193,7 @@ namespace DoNotBeLazy.Patches
                 LocalTargetInfo capturedTarget = target;
                 Map capturedMap = map;
                 options.Add(new FloatMenuOption(
-                    "* " + label,
+                    "* " + label + " until done",
                     () =>
                     {
                         SweepManager mgr = capturedMap.GetComponent<SweepManager>();
@@ -358,6 +373,12 @@ namespace DoNotBeLazy.Patches
         // scanCells defs (e.g. GrowerSow - sow crops) have no Thing to
         // check: the target IS the clicked cell itself, empty or not, so
         // that branch runs regardless of what's in thingsHere.
+        //
+        // forced:true throughout - this is a manually-issued player order,
+        // same as vanilla's own float-menu building. WorkGiver_GrowerSow's
+        // JobOnCell threads forced straight into its reservation check
+        // (ignoreOtherReservations), so leaving it false was silently
+        // failing sow/harvest on perfectly valid cells.
         private static LocalTargetInfo FindTargetWithJob(List<Pawn> pawns, WorkGiverDef def, WorkGiver_Scanner scanner, IntVec3 cell, List<Thing> thingsHere)
         {
             if (def.scanCells)
@@ -366,7 +387,7 @@ namespace DoNotBeLazy.Patches
                 {
                     try
                     {
-                        if (scanner.HasJobOnCell(pawn, cell))
+                        if (scanner.HasJobOnCell(pawn, cell, true))
                         {
                             return cell;
                         }
@@ -388,7 +409,7 @@ namespace DoNotBeLazy.Patches
                         // targets - one bad def shouldn't eat the menu
                         try
                         {
-                            if (scanner.HasJobOnThing(pawn, thing))
+                            if (scanner.HasJobOnThing(pawn, thing, true))
                             {
                                 return thing;
                             }

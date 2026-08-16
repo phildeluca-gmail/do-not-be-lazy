@@ -84,7 +84,10 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (!scanner.HasJobOnCell(forPawn, cell))
+                // forced:true - matches how a manually-issued order behaves
+                // in vanilla (e.g. bypasses ignoreOtherReservations-style
+                // conflicts that only block the AI's own automatic scan)
+                if (!scanner.HasJobOnCell(forPawn, cell, true))
                 {
                     continue;
                 }
@@ -143,7 +146,7 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (!scanner.HasJobOnThing(forPawn, thing))
+                if (!scanner.HasJobOnThing(forPawn, thing, true))
                 {
                     continue;
                 }

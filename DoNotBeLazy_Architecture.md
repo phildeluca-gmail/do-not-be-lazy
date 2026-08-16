@@ -10,7 +10,100 @@ build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
 mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
 
+**Fixed: severe regression introduced by the previous session's own
+giverClass-dedup fix.** That fix (for the deliver-resources-shown-twice
+bug) deduped `eligibleDefs` by `def.giverClass`. Turns out `giverClass`
+is not a safe uniqueness key across the whole WorkGiverDef set: **all
+~19 workstation bill types** (cooking, smithing, tailoring, art,
+stonecutting, smelting, drug production, everything routed through
+`WorkGiver_DoBill`) **share that exact one giverClass**, so the dedup
+was silently collapsing every workstation type in the game down to just
+one surviving `*` option. Reverted to the original approach: a scoped,
+explicit `ExcludedDefNames` denylist naming the two Hauling-tagged
+duplicate defs specifically (`DeliverResourcesToFrames`,
+`DeliverResourcesToBlueprints`), leaving their Construction-tagged
+identical-behavior counterparts as the sole survivors. Caught via a
+user bug report before it shipped to a broader install base - worth
+remembering: **any future "dedupe by some shared property" idea needs
+its uniqueness assumption checked against the *whole* def set, not just
+the two defs that originally motivated it.**
+- **Not fixable as a simple bug: "pack vehicles" (caravan loading).**
+  `WorkGiver_HelpGatheringItemsForCaravan` doesn't implement
+  `HasJobOnThing`/`HasJobOnCell` at all - it overrides `NonScanJob()`,
+  a third WorkGiver mechanism this mod's detection pipeline (built
+  entirely around Thing/cell scanning) never calls. It's also gated on
+  an active, in-progress `LordJob_FormAndSendCaravan` (Lord/game-state
+  driven, not tied to a clickable target) - confirmed via its decompiled
+  source. This isn't a target-scoped "sweep an area" task the way
+  everything else in this mod is; supporting it would need a
+  genuinely different code path, not a quick fix. Out of scope unless
+  explicitly prioritized.
+- **Unconfirmed: "cannot force-haul stone blocks."** `HaulGeneral`'s
+  actual logic (confirmed via decompiled `WorkGiver_Haul`/`HaulAIUtility`
+  source) only fails `PawnCanAutomaticallyHaulFast` on unreachability,
+  reservation conflict (which `forced: true` already bypasses), being
+  reserved food for prisoners, or being on fire - then calls
+  `HaulToStorageJob`, which returns null if there's no valid stockpile
+  destination. No code-level reason stone blocks specifically would
+  differ from any other haulable already confirmed working. Best guess,
+  matching the earlier wood-hauling report exactly: check whether a
+  stockpile zone in reach actually has "Blocks" checked in its allowed
+  items filter - "Blocks" is often a separate category from other raw
+  resources in stockpile presets. Needs confirmation, not yet verified
+  as an actual code bug.
+- **Unconfirmed: "the * forced delivery to (ITEM) is gone."** Could not
+  find a code path that would make `ConstructDeliverResourcesToFrames`/
+  `Blueprints` disappear entirely (as opposed to the double-showing bug
+  already fixed) - their giverClass is unique (not part of the
+  `WorkGiver_DoBill` collision above), so the now-reverted dedup logic
+  wouldn't have removed them outright either. Needs a repro to
+  investigate further: what exactly was clicked, and did it show once
+  during the double-showing bug and now shows zero times, or never
+  showed at all this session.
+
+**Phase 5 (idle pawn nudge, section 5.4) is architected but NOT
+implemented** - planning only, per explicit request. A companion new
+mod, Do Not Freak Out, is also architected but not started - see
+`DoNotFreakOut_Architecture.md`.
+
 **From in-game testing (2026-08-15):**
+- **Fixed: right-clicking a construction target showed two identical
+  `* deliver resources...` options.** `ConstructDeliverResourcesToFrames`
+  (workType Construction) and `DeliverResourcesToFrames` (workType
+  Hauling) - and the Blueprints equivalents - are literally the same
+  `giverClass` registered twice under different WorkTypeDefs, so whichever
+  work priority the player has higher governs it in vanilla. Since this
+  mod includes both Construction and Hauling categories, both got offered
+  as separate, functionally-identical `*` options. `EligibleDefs` now
+  de-dupes by `giverClass` (not `equivalenceGroup` - that field also
+  covers `ConstructFinishFrames`, which is a genuinely different action
+  with its own giverClass and would have been wrongly hidden by grouping
+  on that instead).
+- **`* construct placed frames` (finish frame) not appearing alongside
+  the deliver-resources options is expected, not a bug**, if the frame
+  isn't fully resourced yet - `WorkGiver_ConstructFinishFrames` only has
+  a job once all materials are delivered, same as vanilla. It should show
+  up once resourcing is complete (from a `* deliver resources` sweep or
+  otherwise) on a later right-click at that same spot.
+- **Fixed: Sow/Harvest still didn't work on ordinary crop cells** even
+  after the "Allow Sow" explanation - turned out to actually be a real
+  bug, not user setup. Every `HasJobOnThing`/`JobOnThing`/`HasJobOnCell`/
+  `JobOnCell` call in this mod (`FloatMenuPatch`, `TaskScanner`,
+  `SweepManager`, `JobTrackerPatch`) was using the default `forced:
+  false`. Vanilla's own float-menu building passes `forced: true` for
+  manually-issued player orders, and the decompiled
+  `WorkGiver_GrowerSow.JobOnCell` threads `forced` straight into its
+  reservation check (`pawn.CanReserve(..., forced)` → maps to
+  `ignoreOtherReservations`) - with `forced: false` a reservation
+  conflict that a real manual order would bypass could silently fail us.
+  All call sites now pass `forced: true`.
+- **Added: `* <label> until done`** on every WorkGiverDef-based sweep
+  option label, per request - not applied to `* Consume`, since that's a
+  one-shot action per pawn, not a loop.
+- Confirmed already correct, no change needed: ineligible pawns (wrong/
+  disabled work type) are already excluded per-task via
+  `PawnValidator.CanSweep` for every WorkGiverDef-based sweep, Growing
+  and PlantCutting included - same mechanism as everything else.
 - **Behavior change, by explicit request: sweeps now resume after a need
   interrupt instead of ending.** Original design (see section 2 history)
   deliberately did NOT auto-resume, to avoid interrupt loops. Reversed:
@@ -47,20 +140,13 @@ verified) - see below for what's come out of that so far.
   nothing.** `PlantsCut` (cutting/chopping) is `workType PlantCutting` -
   a completely separate `WorkTypeDef` from `Growing`, and was missing
   from `SupportedWorkTypeDefNames` entirely. Added.
-- **Empty farm cell doing nothing: confirmed not a mod bug**, not just
-  assumed - pulled the actual decompiled `WorkGiver_GrowerSow` source
-  (public RW-Decompile repos) rather than continuing to guess. In order,
-  `JobOnCell`/`HasJobOnCell` requires: the cell resolves to a
-  `Zone_Growing` (confirmed already true here) **with `allowSow` checked
-  on the zone** - a separate toggle from just being a growing zone, and
-  the one most likely culprit; a plant type the zone can actually
-  calculate for that cell (`CalculateWantedPlantDef` non-null);
-  `PlantUtility.GrowthSeasonNow` true (season/temperature); and the cell
-  clear of any blocking plant/blueprint/frame that isn't already
-  reservable. Any of these failing is vanilla behaving exactly as
-  designed - same code path the base game's own AI uses. Nothing to fix
-  in this mod; next step if it's still not working is checking the
-  zone's "Allow Sow" checkbox specifically.
+- **Empty farm cell doing nothing - revised.** Initially diagnosed as
+  vanilla behaving correctly (zone `allowSow`, plant type, season - all
+  real preconditions `WorkGiver_GrowerSow.JobOnCell` checks, confirmed
+  against its decompiled source). That diagnosis was real but incomplete
+  - it missed the `forced` bug above, which was *also* failing sow/harvest
+  independently of zone setup, since `JobOnCell`'s reservation check
+  depends on it. Both real issues, now both accounted for.
 - Achtung is not part of this user's modlist - deprioritized as a
   compatibility target, see the section 4 bullet. User's actual modlist
   includes **Pick Up And Haul** (Workshop ID 1279012058) - relevant any
@@ -193,10 +279,9 @@ diff against memory:
 - Known open items, not yet closed: `showSweepOverlay` setting has no
   code behind it (section 3.4); `JobTrackerPatch`'s bill-continuation
   branch doesn't verify the ended job's target is the sweep's own bill
-  giver (low risk, documented assumption); multiple WorkGiverDefs
-  covering one activity (e.g. construction's deliver-resources vs
-  finish-frame givers) can produce more than one `*` entry for the same
-  click - menu-noise question, not a bug.
+  giver (low risk, documented assumption). The identical-giverClass
+  duplicate-option case (deliver-resources under both Construction and
+  Hauling) is fixed - see the dated bullet above.
 
 ## 1. Intent
 
@@ -405,6 +490,86 @@ this in a real save is still worth doing**, per Phase 4 below.
 | **Haiku** | 5 | Scaffolding, XML, folder structure, bootstrap, logging |
 | **Sonnet** | 7 | Settings, validators, scanners, job drivers, need monitor, tests |
 | **Opus** | 4 | Float menu patch, sweep manager, compatibility audit, final review |
+
+### 5.4 Phase 5 - Idle Pawn Nudge ("Standing" Rule) - PLANNED, NOT IMPLEMENTED
+
+Architected 2026-08-15 per explicit request. **Not built yet** - this
+section is planning only, no code exists for it.
+
+**Intent:** a periodic, low-frequency check that catches colonists who
+are standing idle (no job, or parked in a wander/wait job) despite
+available work existing, and nudges them to reconsider - without
+picking or assigning a specific job ourselves. This is the counterpart,
+for un-swept colonists going idle, to what `SweepManager`/`TaskScanner`
+already do for pawns actively working a sweep.
+
+**Shares its scan mechanism (same shape, independent implementation) with
+Do Not Freak Out** - a new, separate mod also being architected in this
+pass, see `DoNotFreakOut_Architecture.md`. The two are fully decoupled -
+no code or project dependency between them, each mod runs its own
+scanner.
+
+**Scan mechanism** (a new `GameComponent`, tentatively `IdleScanner.cs`
+under `Components/`):
+- Interval: every 120 ticks (2 real-world seconds at normal 1x game
+  speed). Deliberately tick-based rather than real-time-based, matching
+  every other periodic check already in this mod (`NeedMonitor`,
+  `SweepManager.MapComponentTick`) - at higher game speeds this scans
+  proportionally more often in real time, same as vanilla's own
+  tick-scaled behaviors. Flagged as a choice, not a certainty - revisit
+  if faster-than-real-time scanning at 3x speed turns out to feel too
+  aggressive.
+- Scope: one pawn total per interval, globally across all player-owned
+  spawned maps (not one pawn per map) - a single rotating index over an
+  alphabetically-sorted (`LabelShort`) list of all free colonists across
+  `Find.Maps`, rebuilt fresh each interval (list membership changes as
+  pawns die/join/despawn; rebuilding avoids stale-index bugs from a
+  cached list). Index wraps around via modulo once it reaches the end.
+- Camera: never touched. No `CameraJumper`, no `Find.Selector.Select`,
+  no `Find.CameraDriver` calls anywhere in this component - the "do not
+  move the view" requirement is enforced by simply never calling
+  anything that could move it, not by suppressing some other API's side
+  effect.
+- Skip condition: `pawn.jobs?.curJob?.playerForced == true` - a generic,
+  vanilla-level flag (confirmed present on `Verse.AI.Job` via reflection
+  on the actual game DLL) meaning "this pawn has an active player-forced
+  job," true for `SweepManager`-issued jobs and any other forced order
+  regardless of source. Chosen specifically so this doesn't need to
+  know about `SweepManager`'s internal state, or Do Not Freak Out's -
+  fully decoupled.
+
+**Rule-specific check and action** (this part is unique to Do Not Be
+Lazy; Do Not Freak Out's is different - see its own doc):
+- "Standing" detection: `pawn.jobs?.curJob == null`, or `curJob.def` is
+  one of the idle-family JobDefs (`JobDefOf.Wait`, `Wait_Wander`,
+  `GotoWander`, `Wait_MaintainPosture` - all confirmed present via
+  reflection). Exact JobDef set to finalize during implementation; these
+  four are the reflection-confirmed starting candidates.
+- Action, deliberately minimal: `pawn.jobs.EndCurrentJob(JobCondition.InterruptForced)`
+  (same mechanism `NeedMonitor` already uses). This does **not** hand-pick
+  a job - it just ends whatever idle/wait state the pawn is in, which
+  (per `EndCurrentJob`'s `startNewJob: true` default) triggers the
+  pawn's own think tree to re-evaluate immediately. If real, available
+  work exists that the AI simply hadn't picked up yet, this is enough to
+  surface it. If no work is actually available, the pawn ends up back in
+  an idle/wait job anyway - harmless, not a loop risk, since we only
+  re-nudge on the next scheduled 2-second turn in the rotation, not
+  every tick.
+
+**Settings (new, additive to `DoNotBeLazySettings`):**
+- `idleNudgeEnabled` - bool, default true - master on/off toggle,
+  separate from the existing sweep settings since this is a distinct
+  feature a player might not want.
+
+**Open questions to resolve before implementation, not before:**
+- Should drafted pawns be included in the alphabetical rotation? Current
+  lean: no, exclude them (mirrors `PawnValidator.CanSweep`'s existing
+  drafted-pawn exclusion) - a standing drafted pawn is very likely
+  intentional (holding a position), not neglect.
+- Exact idle-JobDef set may need adjusting once tested in-game -
+  vanilla's idle/wander job family isn't perfectly documented and the
+  four listed are a reasonable starting guess, not a verified-complete
+  list.
 
 ## 6. Dependencies and Development Setup
 

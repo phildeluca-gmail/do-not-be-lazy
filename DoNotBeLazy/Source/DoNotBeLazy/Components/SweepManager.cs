@@ -205,7 +205,7 @@ namespace DoNotBeLazy.Components
 
             foreach (Pawn pawn in ranked)
             {
-                Job job = scanner.JobOnThing(pawn, billGiver);
+                Job job = scanner.JobOnThing(pawn, billGiver, true);
                 if (job == null)
                 {
                     continue;
@@ -349,7 +349,7 @@ namespace DoNotBeLazy.Components
                     return;
                 }
 
-                Job resumeJob = scanner.JobOnThing(pawn, order.WorkstationTarget);
+                Job resumeJob = scanner.JobOnThing(pawn, order.WorkstationTarget, true);
                 if (resumeJob == null)
                 {
                     RemoveSweep(pawn);
@@ -374,7 +374,7 @@ namespace DoNotBeLazy.Components
                     continue;
                 }
 
-                Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing) : scanner.JobOnCell(pawn, target.Cell);
+                Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing, true) : scanner.JobOnCell(pawn, target.Cell, true);
                 if (job == null)
                 {
                     continue;
