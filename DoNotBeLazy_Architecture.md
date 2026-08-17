@@ -1,14 +1,84 @@
-<!-- Updated: 2026-08-15 EDT - in-game testing underway, Consume added -->
+<!-- Updated: 2026-08-17 EDT - first verified in-game sweep, need-pause loop found -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-15)
+## 0. Current Status (2026-08-17)
 
 Phases 1-3 are implemented, an Opus compatibility/correctness pass has
 been run over the Phase 3 files, and the project builds clean (`dotnet
 build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
 mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
+
+**First verified-working sweep (2026-08-17).** A `HaulMerge` sweep ran
+end to end in a real save - 30 targets found, jobs handed out, pool
+counting down, `Succeeded` conditions. Verbose logging is confirmed live
+in game. Everything in the 2026-08-16 sow entry below remains **static
+analysis only** - none of the `GrowerSow` work has been exercised yet.
+A 26-test playtest plan covering it is published at
+`https://claude.ai/code/artifact/e60cfd11-1f82-46a8-9111-a25d9352a2dd`.
+
+**BUG, FOUND NOT FIXED (2026-08-17): the need pause/resume loop.** The
+same log showed a pawn being paused for a critical need after *every
+single task* of a haul sweep - three tasks, three pauses - rather than
+pausing once, eating, and resuming.
+
+`SweepManager.Notify_JobEnded` resumes on the **first** job end after a
+pause (`if (pausedForNeed.Remove(pawn))`) and never checks whether the
+need was actually satisfied. `PauseForNeed` calls
+`EndCurrentJob(InterruptForced)`, which defaults `startNewJob: true`, so
+vanilla's think tree immediately starts *something* - not necessarily an
+eat/sleep/joy job. Whatever it is, when it ends we treat that as "the
+need was addressed" and resume. `NeedMonitor` then re-pauses 60 ticks
+later, because clearing `pausedForNeed` made `IsPaused` false again.
+
+**This corrects a claim made twice in this document** - in section 2 and
+in the 2026-08-15 "sweeps now resume after a need interrupt" entry
+below, both of which asserted that interrupt-loop risk doesn't reappear
+"because resumption is gated on a real job-end event, not a repeated
+need check." That reasoning is wrong: the job-end event can be the
+replacement job that the interrupt itself triggered. Both passages are
+annotated in place; do not re-derive this.
+
+Likely fix, **not implemented and not yet agreed**: re-check the need on
+resume and stay paused while it remains under threshold. Per CLAUDE.md
+that needs a decision and a doc edit before any code.
+
+**Diagnostic gap found the same day: the float-menu path is entirely
+untraced.** `AddConsumeOption`, `FindTargetWithJob`, `IsSweepEligible`
+and the option-building path in `FloatMenuPatch` contain zero
+`Logger.Message` calls - only `Error`/`Warning`. Only `SweepManager` and
+`TaskScanner` emit trace lines, and only *after* an option is chosen. So
+"wrong / missing / duplicate menu option" reports cannot be diagnosed
+from the log at all, however many times they're reproduced; they have to
+be worked out from the defs. Worth adding a verbose line per offered
+option the next time this class of bug comes up.
+
+**Investigated, deliberately not changed (2026-08-17): `* Consume` on a
+corpse.** Reported as "harvesting a corpse at a harvesting table should
+be called harvest, not consume." User's decision is to leave the code
+as-is. Findings, so this isn't re-derived:
+
+- The harvesting table belongs to **Reclaim, Reuse, Recycle (Continued)**
+  (`Mlie.ReclaimReuseRecycle`, Workshop `2567364887`).
+- Its `R3_DoWorkHarvestCorpse` is `giverClass WorkGiver_DoBill`,
+  `workType Doctor`, label "harvest corpse", with
+  `fixedBillGiverDefs: R3_TableHarvesting`. We already offer it
+  correctly as `* Harvest corpse until done`, since `IsSweepEligible`
+  accepts any `WorkGiver_DoBill` regardless of work type.
+- But `fixedBillGiverDefs` means `HasJobOnThing` is true only for the
+  **table**, and `FindTargetWithJob` only inspects things on the clicked
+  cell. So clicking the *corpse* can only ever yield `* Consume ...`;
+  the harvest option requires clicking the *table*. Not a bug so much as
+  a consequence of workstation sweeps being single-target by design
+  (section 4, "Multiple workstations in radius").
+- `RimWorld.IngestibleProperties` (namespace is `RimWorld`, not `Verse`
+  - verified by reflection) defaults `showIngestFloatOption` to **true**
+  and `ingestCommandString` to **empty**. Only drugs set that string in
+  Core, so corpses and plain food fall through to `AddConsumeOption`'s
+  hardcoded `"Consume " + LabelShort`. The resulting label matches
+  vanilla's own wording exactly, so this is a design question rather
+  than a divergence.
 
 **Fixed: severe regression introduced by the previous session's own
 giverClass-dedup fix.** That fix (for the deliver-resources-shown-twice
@@ -249,6 +319,10 @@ scanned cell (which the zone-wide check would cost inside a radial scan).
   already marked paused rather than re-triggering every 60 ticks while
   they sleep it off. Interrupt-loop risk doesn't reappear here because
   resumption is gated on a real job-end event, not a repeated need check.
+  **WRONG - corrected 2026-08-17, see the top of this section.** The
+  job-end event can be the replacement job the interrupt itself started,
+  so the pawn resumes without ever addressing the need and gets re-paused
+  60 ticks later. Observed in a real log. Not yet fixed.
 - **Fixed: right-clicking fire offered `* Sow crops` / `* Harvest crops`
   instead of putting the fire out.** Two things going on:
   - `GrowerHarvest` turned out to be `scanCells` too (not `scanThings` as
@@ -306,8 +380,9 @@ scanned cell (which the zone-wide check would cost inside a radial scan).
   - The "consume" menu (eating food, smoking, snorting drugs) was never
     covered by this mod at all - it's not WorkGiver-based, so it was
     architecturally out of reach of the whole sweep system. **New
-    feature added**: `* <verb> <item>` (e.g. `* Eat meal`, `* Smoke
-    smokeleaf joint`) now appears when an ingestible thing is clicked,
+    feature added**: `* <verb> <item>` (e.g. `* Consume fine meal`,
+    `* Smoke smokeleaf joint`) now appears when an ingestible thing is
+    clicked,
     and orders every eligible selected pawn to take one dose/meal each,
     fired off immediately (not tracked as an ongoing sweep - there's
     nothing to chain, the job either succeeds or it doesn't). See
@@ -438,7 +513,7 @@ A RimWorld 1.5 mod that adds area-sweep task commands to the right-click context
 - Mining: one pawn per cell. Sweep assigns each pawn to a separate unreserved minable cell within radius.
 - Cleaning/other: one pawn per cell. Same as mining - fan out to distinct unreserved cells.
 
-**Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick.
+**Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick. **This last sentence is WRONG - corrected 2026-08-17, see section 0.** The bouncing does happen: a genuine job-end event is not the same as the need being satisfied, and a real log shows a pawn paused after every task of a sweep. Not yet fixed.
 
 ## 3. Technical Architecture
 
@@ -481,7 +556,7 @@ Rather than cloning existing `FloatMenuOption` entries (they don't expose the `W
 
 Sweep-eligible WorkGiverDefs: any whose `Worker is WorkGiver_DoBill` (covers all workstation/bill types without hardcoding each one), plus any whose `workType.defName` is `Hauling`, `Construction`, `Cleaning`, `Mining`, or `Growing` - minus a small `ExcludedDefNames` denylist (currently just `CookFillHopper`, see the status-section bullet above) for specific defs that technically match but produce confusing options nobody wants. Target detection (`FindTargetWithJob`) branches on `def.scanCells` vs `def.scanThings`: cell-scanned defs (`GrowerSow`) check `HasJobOnCell` against the clicked cell directly, so they work even when nothing is on that cell - which is the normal case for an empty tile waiting to be sown.
 
-**Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Eat meal`, `* Smoke smokeleaf joint` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
+**Consume (added 2026-08-15):** Separate from all of the above - eating and drug use aren't `WorkGiverDef`-based in RimWorld at all (`JobDefOf.Ingest` instead), so `AddConsumeOption` in the same file handles it independently of `eligibleDefs`/`SweepManager` entirely. If any `Thing` at the clicked cell has `def.ingestible != null && def.ingestible.showIngestFloatOption` (the same flag vanilla itself uses to decide whether to offer an eat/smoke/snort option), and at least one selected pawn is alive/not downed/not in a mental state and `FoodUtility.WillEat` says yes, a `* <ingestCommandString>` option appears (e.g. `* Smoke smokeleaf joint`, `* Snort yayo` - `ingestCommandString` is the same per-ThingDef format vanilla uses, so wording matches). **Corrected 2026-08-17:** only *drugs* set `ingestCommandString` in Core - it defaults to empty, verified by reflection on `RimWorld.IngestibleProperties`. Plain food and corpses therefore fall through to the hardcoded `"Consume " + LabelShort` fallback and read `* Consume fine meal`, not `* Eat meal`. That still matches vanilla's own English wording, which uses the `ConsumeThing` key for the same fallback. Choosing it fires one `JobDefOf.Ingest` job per eligible pawn immediately, sized via the vanilla `FoodUtility.WillIngestStackCountOf` helper (same one the base game's single-pawn "Eat X" order uses) - not tracked as a sweep, since there's nothing to interrupt or chain: it's a one-shot order per pawn, same as manually right-clicking for each of them individually.
 
 Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based sweeps) - you can manually order a drafted pawn to eat or take a combat drug in vanilla, and dosing a raiding party before a fight is a real use case. Also does not gate on hunger level - a manual order works regardless of current need, matching vanilla's manual-order semantics. If the stack doesn't have enough for everyone, later pawns in the loop may fail to get their dose once the stack runs empty from under them - not handled specially, since vanilla's own job system already has to tolerate pawns racing for the same food and fails harmlessly rather than crashing.
 

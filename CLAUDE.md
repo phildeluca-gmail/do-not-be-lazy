@@ -10,7 +10,7 @@ This file governs how Claude Code operates in this project. Read it fully before
 
 Load all referenced documents at the start of every session and before any implementation work begins.
 
-- `./NEXT_SESSION.md` - Session pickup file. **Read this first, before the other two.** Fast orientation on current state: what is and is not committed, what is and is not verified in game, open bugs, the log-extraction workflow, and traps that have already cost time once. Rewritten at the end of most sessions.
+- `./NEXT_SESSION.md` - Session pickup file. **Read this first, before the other two.** Fast orientation on current state: what is and is not committed, what is and is not verified in game, open bugs, the log-extraction workflow, and traps that have already cost time once. Rewritten at the end of most sessions. The `claude --resume <id>` command for the most recent conversation sits at the very top of that file, with older session ids listed below it - resume rather than starting fresh if a session was cut short. Current session: `88fc941c-80ed-4d29-b235-7b39abac91ce`.
 - `./DoNotBeLazy_Architecture.md` - Mod architecture document. Defines intent, core behaviors, component structure, edge cases, Claude Code execution plan with model assignments, and dependency setup.
 - `./human-style-coding-260327.md` - Human-style coding guide. Defines comment style, naming conventions, abstraction rules, and stylistic drift. Written for JS/Python examples but applies to C# with the overrides below.
 
@@ -56,6 +56,7 @@ If a task falls outside the scope of both documents, ask before making assumptio
 
 ## General Behavior
 
+- **Keep chat replies brief where possible.** Short answers, no restating the question, no padding around a result. Go deeper when asked, or when a finding genuinely needs the detail. This governs conversation only - the docs in this repo stay dense on purpose.
 - Do not add Harmony patches, files, or dependencies not described in `./DoNotBeLazy_Architecture.md` unless explicitly instructed.
 - Do not add NuGet packages. All dependencies are local DLLs in `./lib/` (see Section 6.0 of the architecture doc).
 - Do not deviate from the code style in `./human-style-coding-260327.md` for reasons of preference or convention.
