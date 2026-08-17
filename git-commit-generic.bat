@@ -1,32 +1,67 @@
 @echo off
 :: ============================================================
 :: git-commit-generic.bat
-:: Drop this file in the root of any git repository.
-:: Customize the STAGE section below for your project,
-:: then double-click to stage, commit, and push.
+:: Stage, commit, and push this repository.
+:: Double-click to run.
+::
+:: 2026-08-16: was still staging "SpotTheDifference Files/" from
+:: another project. That pathspec matches nothing here, so nothing
+:: was ever staged, the commit failed, and push ran anyway - and it
+:: still printed "Done", which made a silent no-op look like success.
+:: Now stages everything (matching the convention in CLAUDE.md) and
+:: refuses to continue when a step fails.
 :: ============================================================
 
 cd /d "%~dp0"
 
 :: ============================================================
-:: STAGE — replace or add "git add" lines for your project
+:: STAGE
 :: ============================================================
-git add "SpotTheDifference Files/"
-:: git add "src/"
-:: git add "assets/"
-:: git add "*.json"
-:: git add -A     <- stages everything (use with caution)
+git add -A
+if errorlevel 1 (
+    echo.
+    echo ERROR: git add failed. Nothing committed.
+    pause
+    exit /b 1
+)
 
-:: Show what will be committed
-git status
+:: Bail out if there is nothing staged, rather than "committing" nothing
+git diff --cached --quiet
+if not errorlevel 1 (
+    echo.
+    echo Nothing to commit - working tree clean.
+    pause
+    exit /b 0
+)
 
-:: Prompt for commit message
+:: Show exactly what is about to be committed
+echo.
+echo === Files staged for commit ===
+git status --short
+echo.
+git diff --cached --stat
+echo.
+
 set /p MSG="Commit message: "
 if "%MSG%"=="" set MSG=Update files
 
 git commit -m "%MSG%"
+if errorlevel 1 (
+    echo.
+    echo ERROR: commit failed. Nothing pushed.
+    pause
+    exit /b 1
+)
+
 git push
+if errorlevel 1 (
+    echo.
+    echo ERROR: push failed. The commit exists locally but is NOT on GitHub.
+    echo Fix the problem and run "git push" again.
+    pause
+    exit /b 1
+)
 
 echo.
-echo Done.
+echo Done - committed and pushed.
 pause
