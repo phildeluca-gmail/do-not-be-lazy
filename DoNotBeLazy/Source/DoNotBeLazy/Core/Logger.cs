@@ -1,8 +1,14 @@
 namespace DoNotBeLazy.Core
 {
     // Named Logger (not Log) to avoid colliding with Verse.Log when both
-    // namespaces are in scope. VerboseLogging will be wired to
-    // DoNotBeLazySettings once that exists (Phase 2).
+    // namespaces are in scope.
+    //
+    // VerboseLogging is driven by the settings checkbox - set from
+    // DoNotBeLazySettings on both ExposeData (load) and the toggle itself.
+    // It sat hardcoded false from Phase 1 until 2026-08-16, which silently
+    // made every Logger.Message call in the mod a no-op: several live
+    // playtest logs showed zero DoNotBeLazy lines and were read as "nothing
+    // fired" when the truth was "nothing could be printed".
     public static class Logger
     {
         public static bool VerboseLogging = false;

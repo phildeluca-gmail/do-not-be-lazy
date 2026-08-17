@@ -23,6 +23,12 @@ namespace DoNotBeLazy.Components
         public List<LocalTargetInfo> SharedPool { get; }
         public Thing WorkstationTarget { get; }
 
+        // Targets already put back in the pool once after the WorkGiver
+        // answered with blocker-clearing work instead of the task itself.
+        // Capped at one re-queue each: a cell that can never be satisfied
+        // would otherwise hand out the same preparatory job forever.
+        public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
+
         public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null)
         {
             WorkGiverDef = workGiverDef;
@@ -53,7 +59,20 @@ namespace DoNotBeLazy.Components
     {
         private const int StateCheckIntervalTicks = 60;
 
+        // A sweep survives individual targets failing (see Notify_JobEnded),
+        // but not endlessly. Each failure re-enters AssignNextTask from
+        // inside EndCurrentJob, so an unbounded retry is also unbounded
+        // recursion if every target fails on the tick it's handed out. Eight
+        // consecutive failures with no successful task in between reads as
+        // "this sweep isn't going to work" rather than "unlucky target".
+        private const int MaxConsecutiveFailures = 8;
+
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
+
+        // Per-pawn, not per-order: a SweepOrder is shared across everyone in
+        // a group sweep, and one pawn hitting bad targets shouldn't count
+        // against the others. Reset on any successful task.
+        private readonly Dictionary<Pawn, int> consecutiveFailures = new Dictionary<Pawn, int>();
 
         // pawns pulled out of their sweep job for a critical need but still
         // tracked in activeSweeps - NeedMonitor adds them here via
@@ -121,6 +140,7 @@ namespace DoNotBeLazy.Components
         {
             activeSweeps.Remove(pawn);
             pausedForNeed.Remove(pawn);
+            consecutiveFailures.Remove(pawn);
         }
 
         public bool IsPaused(Pawn pawn)
@@ -275,8 +295,11 @@ namespace DoNotBeLazy.Components
             List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, DoNotBeLazyMod.Settings.sweepRadius, map, workGiverDef, driver);
             if (pool.Count == 0)
             {
+                Logger.Message($"BeginSweep {workGiverDef.defName}: scan found nothing, no sweep started");
                 return;
             }
+
+            Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns");
 
             var order = new SweepOrder(workGiverDef, pool);
 
@@ -299,6 +322,10 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
+            // the condition is what decides continue-vs-stop, and "the pawn
+            // wandered off" reports are almost always answered by this line
+            Logger.Message($"{pawn.LabelShort}: job ended {condition} ({order.WorkGiverDef.defName})");
+
             if (pausedForNeed.Remove(pawn))
             {
                 // this wasn't a sweep task ending - it's the pawn's own
@@ -314,13 +341,61 @@ namespace DoNotBeLazy.Components
             // already tried requeuing the same bill giver and came up empty,
             // or the job didn't succeed. Either way there's no pool to draw
             // the next target from.
-            if (condition != JobCondition.Succeeded || order.WorkGiverDef.Worker is WorkGiver_DoBill)
+            if (order.WorkGiverDef.Worker is WorkGiver_DoBill)
             {
                 RemoveSweep(pawn);
                 return;
             }
 
+            if (condition == JobCondition.Succeeded)
+            {
+                consecutiveFailures.Remove(pawn);
+                AssignNextTask(pawn, order);
+                return;
+            }
+
+            // Used to end the sweep on any non-Succeeded condition, which
+            // meant a single bad target killed an entire "until done" order
+            // and the pawn silently wandered off to whatever vanilla's think
+            // tree picked next. That's what made the GrowerSow plantDefToSow
+            // bug look like "sowing does nothing" rather than "one cell got
+            // skipped". A failed *target* is not a failed *sweep*: drop that
+            // target and hand out the next one.
+            if (!TargetFailureIsRecoverable(condition))
+            {
+                RemoveSweep(pawn);
+                return;
+            }
+
+            consecutiveFailures.TryGetValue(pawn, out int failures);
+            failures++;
+            if (failures >= MaxConsecutiveFailures)
+            {
+                Logger.Message($"{pawn.LabelShort}: {failures} sweep tasks failed in a row ({condition}), ending sweep.");
+                RemoveSweep(pawn);
+                return;
+            }
+
+            consecutiveFailures[pawn] = failures;
             AssignNextTask(pawn, order);
+        }
+
+        // Split JobCondition into "that target didn't work out" (keep the
+        // sweep, try the next one) and "something took this pawn away from
+        // us" (stop - continuing would fight the player or the AI).
+        //
+        // Deliberately conservative on the interrupt conditions: both
+        // InterruptForced and InterruptOptional mean something else decided
+        // this pawn should be doing something different - a manual order,
+        // drafting, a mental break, another mod. Retrying there would have
+        // the sweep tug-of-war with whatever interrupted it. Errored means
+        // a genuine exception in the job system, where retrying risks a
+        // loop rather than a recovery.
+        private static bool TargetFailureIsRecoverable(JobCondition condition)
+        {
+            return condition == JobCondition.Incompletable      // target no longer workable
+                || condition == JobCondition.QueuedNoLongerValid // target invalidated before we got there
+                || condition == JobCondition.ErroredPather;      // couldn't path to this one target
         }
 
         private void AssignNextTask(Pawn pawn, SweepOrder order)
@@ -369,15 +444,39 @@ namespace DoNotBeLazy.Components
                 LocalTargetInfo target = order.SharedPool[i];
                 order.SharedPool.RemoveAt(i);
 
-                if (!TargetStillValid(pawn, target))
+                if (!TargetStillValid(pawn, target, scanner))
                 {
                     continue;
                 }
 
+                // must precede JobOnCell - this is the call that actually
+                // bakes plantDefToSow into the job, so a stale value here is
+                // what sends pawns to sow the wrong crop (or unzoned dirt)
+                // and then fails them out on the walk over
+                GrowerCompat.ResetWantedPlantDef(scanner);
+
                 Job job = target.HasThing ? scanner.JobOnThing(pawn, target.Thing, true) : scanner.JobOnCell(pawn, target.Cell, true);
                 if (job == null)
                 {
+                    Logger.Message($"{pawn.LabelShort}: no job for {target} ({order.WorkGiverDef.defName}), {order.SharedPool.Count} left");
                     continue;
+                }
+
+                // plantDefToSow is the field the whole GrowerSow static-state
+                // bug turned on, so name it explicitly - "which crop did we
+                // actually tell them to plant, on which cell" is the single
+                // most useful line in a sow trace
+                Logger.Message($"{pawn.LabelShort}: {job.def.defName} on {target}"
+                    + (job.plantDefToSow != null ? $" plant={job.plantDefToSow.defName}" : "")
+                    + $" ({order.SharedPool.Count} left)");
+
+                // WorkGiver answered "clear this blocker first" rather than
+                // the work asked for (GrowerSow returns CutPlant/HaulAside).
+                // Put the target back so the real work still happens once the
+                // blocker's gone, instead of dropping the cell we just cleared.
+                if (GrowerCompat.IsPreparatoryJob(job, target) && order.Requeued.Add(target))
+                {
+                    order.SharedPool.Add(target);
                 }
 
                 GiveJob(pawn, job);
@@ -388,11 +487,22 @@ namespace DoNotBeLazy.Components
             RemoveSweep(pawn);
         }
 
-        private bool TargetStillValid(Pawn pawn, LocalTargetInfo target)
+        // The pool is built once, against one driver pawn, at sweep start.
+        // Everything re-checked here is something that can differ per pawn
+        // (allowed area, reachability) or drift while the sweep runs (the
+        // target getting destroyed, forbidden, reserved, or its zone's sow
+        // toggle being switched off mid-sweep).
+        private bool TargetStillValid(Pawn pawn, LocalTargetInfo target, WorkGiver_Scanner scanner)
         {
-            // pool was built against one driver pawn's allowed area - the
-            // rest of the group can have different zones, so re-check here
             Area allowed = pawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
+
+            // checked for both target kinds up front: a fire that starts
+            // after the pool was built is exactly the case the scan-time
+            // filter can't catch, and a sweep can run for a long while
+            if (TaskScanner.TargetIsBurning(target, map))
+            {
+                return false;
+            }
 
             if (target.HasThing)
             {
@@ -409,18 +519,30 @@ namespace DoNotBeLazy.Components
                 {
                     return false;
                 }
+                if (!GrowerCompat.CanReachTarget(pawn, thing, scanner))
+                {
+                    return false;
+                }
                 return map.reservationManager.CanReserve(pawn, thing);
             }
 
             // cell target (e.g. an empty tile waiting to be sown) - no
             // Thing to check Destroyed/forbidden on, just bounds + area +
-            // reservation
+            // sow gates + reachability + reservation
             IntVec3 cell = target.Cell;
             if (!cell.InBounds(map))
             {
                 return false;
             }
             if (allowed != null && !allowed[cell])
+            {
+                return false;
+            }
+            if (!GrowerCompat.SowSettingsAllow(scanner, cell, map))
+            {
+                return false;
+            }
+            if (!GrowerCompat.CanReachTarget(pawn, cell, scanner))
             {
                 return false;
             }

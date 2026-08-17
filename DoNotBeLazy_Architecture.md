@@ -66,6 +66,137 @@ implemented** - planning only, per explicit request. A companion new
 mod, Do Not Freak Out, is also architected but not started - see
 `DoNotFreakOut_Architecture.md`.
 
+**From in-game testing (2026-08-16) - the WorkGiver static-state class of
+bug.** Reported: "`* sow crops` appears but doesn't sow crops, the pawns
+seem to get new jobs", plus "sow assigns sowing to unzoned terrain and
+should only sow in zoned terrain." Both are the **same root cause**, and
+it generalizes past `GrowerSow`.
+
+`WorkGiver_Grower.wantedPlantDef` is a **mutable `protected static`
+field** (verified by reflection against the real
+`lib/Assembly-CSharp.dll`, not assumed). Vanilla only ever initializes it
+inside `PotentialWorkCellsGlobal`: `WorkGiver_GrowerSow.ExtraRequirements`
+sets it per zone/building, and the enumerator nulls it after each one.
+This mod never calls `PotentialWorkCellsGlobal` - the whole detection
+pipeline calls `HasJobOnCell`/`JobOnCell` directly - so that setup never
+runs and the field holds whatever the last caller left in it.
+`JobOnCell` only recomputes it lazily, `if (wantedPlantDef == null)`.
+Two distinct failures fall out:
+
+- **Wrong crop / job dies on arrival.** A stale non-null value is baked
+  into `new Job(JobDefOf.Sow, c) { plantDefToSow = wantedPlantDef }`.
+  `JobDriver_PlantSow`'s *goto* toil then hard-`FailOn`s
+  `!job.plantDefToSow.CanEverPlantAt(TargetLocA, Map)` (and on
+  `AdjacentSowBlocker`), so the job dies during the walk, before any
+  work. Non-`Succeeded` -> `Notify_JobEnded` -> `RemoveSweep` -> vanilla's
+  think tree immediately hands the pawn something unrelated. That is
+  exactly the reported "pawns seem to get new jobs", and the user's log
+  shows the matching chain (`EndCurrentJob` -> `TryFindAndStartJob` ->
+  `DetermineNextJob` -> `JobGiver_Work`) with **no** DoNotBeLazy error
+  lines - nothing threw, the mod issued a job that vanilla correctly
+  rejected.
+- **Sowing unzoned terrain.** Zone membership is never checked
+  explicitly anywhere in `JobOnCell`. The *only* gate is
+  `CalculateWantedPlantDef` returning null (via
+  `GridsUtility.GetPlantToGrowSettable`, which returns null when a cell
+  has neither a plant-grower edifice nor a growing zone) - and that call
+  lives inside the `if (wantedPlantDef == null)` branch. A stale non-null
+  value skips the branch, so the gate never runs and bare dirt falls
+  through to a sow job.
+
+`WorkGiver_GrowerHarvest` is unaffected: no `ExtraRequirements` override,
+and it recomputes per cell via `CalculateWantedPlantDef`.
+
+**Generalized lesson, and the second one of this shape** (after the
+`giverClass` dedup regression): vanilla WorkGivers put real preconditions
+in `Potential*Global`/`ExtraRequirements`, not in `JobOn*`. Calling
+`JobOn*` directly - this mod's entire architecture - silently bypasses
+all of them. Before adding any WorkGiverDef to the eligible set, read the
+worker's decompiled source and check for (a) mutable static fields, (b)
+an `ExtraRequirements` override, (c) reachability/fire/zone-toggle checks
+that live in the scan rather than the job.
+
+Four fixes, all in this pass (new `Utility/GrowerCompat.cs` holds the
+shared logic; see 3.2):
+
+1. **Reset the static before every Grower `HasJobOnCell`/`JobOnCell`
+   call** (`FloatMenuPatch.FindTargetWithJob`, `TaskScanner.ScanCells`,
+   `SweepManager.AssignNextTask`). Nulling it restores correct per-cell
+   semantics through vanilla's own lazy branch, and with it the zone
+   gate. Fixes both reported symptoms.
+2. **Apply the `ExtraRequirements` gates that fix 1 does *not* restore** -
+   `IPlantToGrowSettable.CanAcceptSowNow()` and `Zone_Growing.allowSow`.
+   These live only in `ExtraRequirements`, which is never called at all,
+   so without this a zone with "allow sow" toggled off is still swept.
+3. **Reachability.** `WorkGiver_Grower.AllowUnreachable` is `true`, which
+   is precisely why vanilla does its own `pawn.CanReach` per zone inside
+   `PotentialWorkCellsGlobal`. Neither `TaskScanner` nor `PawnValidator`
+   checked reachability at all, so one unpathable cell produced a job
+   that failed and killed the whole sweep through the same
+   `RemoveSweep` path.
+4. **Blocker-job chaining.** `GrowerSow.JobOnCell` legitimately returns a
+   `CutPlant` or `HaulAside` job *instead of* `Sow` when something blocks
+   the cell. On success `Notify_JobEnded` advanced to the next pool
+   entry, so the cell just cleared never got sown. Preparatory jobs are
+   now detected (returned job's `targetA` differs from the target asked
+   about) and the cell is re-queued **once** - the once-only guard is
+   what keeps an unsatisfiable target from looping. Note this check is
+   not scoped to cell targets: construction deliver-resource jobs also
+   point `targetA` at the resource rather than the frame, so frames get
+   one extra re-queue too. Plausibly an improvement (frames usually need
+   several deliveries) and it's capped, but it is untested beyond sow.
+
+**A failed target is no longer a failed sweep (2026-08-16).** Separate
+from the four fixes above, and the reason the `plantDefToSow` bug
+presented as "sowing does nothing" rather than "one cell got skipped":
+`Notify_JobEnded` ended the entire sweep on *any* non-`Succeeded`
+`JobCondition`, then vanilla's think tree handed the pawn something
+unrelated. For an "until done" command that's the wrong default - a raid
+interrupting a pawn, another colonist claiming a target first, or one
+unreachable cell all silently cancelled the whole order.
+
+`JobCondition` is now split (`TargetFailureIsRecoverable`):
+
+- `Incompletable`, `QueuedNoLongerValid`, `ErroredPather` - the *target*
+  didn't work out. Drop it, hand out the next one, sweep continues.
+- `InterruptForced`, `InterruptOptional` - something deliberately took
+  this pawn (manual order, drafting, mental break, another mod).
+  Retrying would tug-of-war with whoever interrupted, so the sweep ends.
+- `Errored` - a real exception in the job system; retrying risks a loop
+  rather than a recovery. Ends the sweep.
+
+Bounded by `MaxConsecutiveFailures` (8), tracked **per pawn** in
+`SweepManager.consecutiveFailures` and reset on any successful task
+(per-pawn rather than per-`SweepOrder` because an order is shared across
+a group sweep, and one pawn's bad luck shouldn't count against the
+others). The bound is not just a heuristic: each retry re-enters
+`AssignNextTask` from inside `EndCurrentJob`, so an unbounded retry is
+also unbounded recursion if every target fails on the tick it's issued.
+Eight failures with no success in between ends the sweep with a log line.
+
+**Fire is now filtered per target, not just on the clicked cell
+(2026-08-16).** The earlier fire fix bailed out of the whole right-click
+if the clicked cell held a `Fire` - but that only covers the one tile the
+player aimed at, and a sweep radius routinely spans tiles they never
+looked at. Nothing filtered fire during the scan at all: `GrowerSow` and
+`GrowerHarvest` don't check it (a scorched-but-mature plant, or a cell
+burnt back to bare ground, still passes `HasJobOnCell`), and vanilla's
+own guards - `Zone_Growing.ContainsStaticFire`, `Building.IsBurning()` -
+live in `PotentialWorkCellsGlobal`, which this mod never calls. Same
+`Potential*Global`-bypass class as everything else in this entry.
+
+`TaskScanner.TargetIsBurning` (via `RimWorld.FireUtility`) is applied in
+both scan branches and again in `SweepManager.TargetStillValid` - the
+re-check matters because a sweep can run for a long time and a fire that
+starts after the pool was built is precisely what the scan-time filter
+cannot catch.
+
+**Deliberate divergence from vanilla:** vanilla skips an *entire* grow
+zone when it contains static fire. This filters per target instead, so
+the unburnt part of a field stays workable - better behaviour for an
+explicit player order, and it avoids re-walking every zone cell once per
+scanned cell (which the zone-wide check would cost inside a radial scan).
+
 **From in-game testing (2026-08-15):**
 - **Fixed: right-clicking a construction target showed two identical
   `* deliver resources...` options.** `ConstructDeliverResourcesToFrames`
@@ -337,6 +468,7 @@ DoNotBeLazy/
       Utility/
         TaskScanner.cs             # Radius search, task matching
         PawnValidator.cs           # Permission/capability checks
+        GrowerCompat.cs            # WorkGiver_Grower static-state + sow gates
 ```
 
 ### 3.2 Component Descriptions
@@ -357,7 +489,7 @@ Deliberately does **not** exclude drafted pawns (unlike the WorkGiver-based swee
 
 **SweepManager.cs** - A `MapComponent` maintaining `Dictionary<Pawn, SweepOrder>`. `SweepOrder` holds a `WorkGiverDef` and a `SharedPool` (`List<LocalTargetInfo>`) - for area sweeps, every pawn assigned in the same `BeginSweep` call shares the same pool instance, so claiming a target for one pawn removes it for the rest of the group (implements "nearest unassigned task first" via a linear nearest-in-pool scan per assignment). Workstation orders carry an empty pool since bill continuation doesn't use it (see JobTrackerPatch below). `LocalTargetInfo` transparently covers both Thing and cell targets, so the pool/nearest-scan logic didn't need to change to support `GrowerSow` - only the two spots that branch on target type explicitly did: `AssignNextTask` calls `scanner.JobOnCell` instead of `JobOnThing` when `!target.HasThing`, and `TargetStillValid` checks cell bounds/area/reservation instead of Thing-specific checks (Destroyed, forbidden) for the same case.
 
-Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool.
+Job-to-job chaining is **event-driven**, not tick-polled: `JobTrackerPatch`'s postfix on `Pawn_JobTracker.EndCurrentJob` calls `SweepManager.Notify_JobEnded(pawn, condition)` when a swept pawn's job ends, and that pulls the next target off the shared pool. A non-`Succeeded` condition does not necessarily end the sweep - see `TargetFailureIsRecoverable` and the 2026-08-16 status entry for how target-scoped failures are separated from pawn-scoped interrupts, and for the per-pawn `MaxConsecutiveFailures` bound that keeps the retry path from recursing.
 
 Because `TryTakeOrderedJob` interrupts the pawn's current job, it re-enters `EndCurrentJob` (verified in IL: `TryTakeOrderedJob` -> `StartJob` -> `EndCurrentJob`), so every job handout the mod makes fires `JobTrackerPatch`'s own postfix with `InterruptForced` - which used to cancel the sweep that was mid-handout. All handouts now go through `SweepManager.GiveJob`, which raises a static `SweepManager.AssigningJob` flag that `JobTrackerPatch` checks and ignores. `MapComponentTick()` runs every 60 ticks and only checks for state changes nothing else observes - dead/downed/mental-break/drafted/off-map pawns get pulled from `activeSweeps`.
 
@@ -370,9 +502,17 @@ No `ExposeData()` on `SweepManager` - sweeps are cleared on load, matching the "
 **TaskScanner.cs** - Static utility. Given a cell, radius, map, `WorkGiverDef`, and a driving pawn, returns a `List<LocalTargetInfo>` of matching incomplete tasks, via two independent branches (a def can be either or both):
 
 - `ScanThings` (for `scanThings` defs): `scanner.PotentialWorkThingsGlobal(forPawn)` filtered by squared-distance-from-center, forbidden, allowed area, `CanReserve`, and `HasJobOnThing`. `PotentialWorkThingsGlobal` returns **null** on `WorkGiver_Scanner` itself and most WorkGivers never override it (construction and `WorkGiver_DoBill` included), so this falls back to `map.listerThings.ThingsMatching(scanner.PotentialWorkThingRequest)`, guarding against an undefined `ThingRequest` (which `ThingsMatching` throws on) - mirrors what vanilla's `JobGiver_Work` does.
-- `ScanCells` (for `scanCells` defs, added 2026-08-15 to fix the missing-Sow bug): `GenRadial.RadialCellsAround(center, radius, true)` - the `GenRadial` approach originally planned for everything, kept for just this branch since there's no thing-lister equivalent for "empty cells that could be sown." Filtered by bounds, allowed area, `CanReserve`, and `HasJobOnCell`.
+- `ScanCells` (for `scanCells` defs, added 2026-08-15 to fix the missing-Sow bug): `GenRadial.RadialCellsAround(center, radius, true)` - the `GenRadial` approach originally planned for everything, kept for just this branch since there's no thing-lister equivalent for "empty cells that could be sown." Filtered by bounds, allowed area, `CanReserve`, `GrowerCompat` sow gates, reachability, and `HasJobOnCell`.
+
+Both branches check reachability (`pawn.CanReach` with the scanner's own `PathEndMode`, at `Danger.Deadly` since these are manually-issued player orders). This is not redundant with vanilla: `WorkGiver_Grower.AllowUnreachable` is `true`, meaning the framework deliberately skips its usual reachability filter and expects the WorkGiver's own `Potential*Global` to do it - which this mod never calls. Without the check, an unreachable target yields a job that fails on pathing, and that non-`Succeeded` end kills the entire sweep via `RemoveSweep`.
 
 Filters out tasks already claimed by another pawn via the normal reservation system (no sweep-specific claim tracking needed).
+
+**GrowerCompat.cs** (added 2026-08-16) - Static utility isolating everything this mod has to do by hand because it calls `JobOn*` directly instead of going through `PotentialWorkCellsGlobal`. See the 2026-08-16 status entry for the full reasoning. Three responsibilities:
+
+- `ResetWantedPlantDef(scanner)` - nulls `WorkGiver_Grower.wantedPlantDef` (a shared mutable static, reached via a cached Harmony `StaticFieldRefAccess` delegate rather than per-call `FieldInfo.SetValue`, since this runs once per cell in a radial scan). No-op for non-Grower scanners. **Must be called immediately before every `HasJobOnCell`/`JobOnCell` on a Grower scanner** - it is what makes vanilla's lazy `if (wantedPlantDef == null)` recompute per cell, which in turn is what restores both the correct `plantDefToSow` and the zone-membership gate.
+- `SowSettingsAllow(cell, map)` - the `ExtraRequirements` gates that resetting the static does *not* restore: `IPlantToGrowSettable.CanAcceptSowNow()` and `Zone_Growing.allowSow`. Applied to `WorkGiver_GrowerSow` only; `GrowerHarvest` has no `ExtraRequirements` override to mirror.
+- `IsPreparatoryJob(job, target)` - true when a WorkGiver returned a blocker-clearing job (`CutPlant`, `HaulAside`) rather than the work asked for, detected by the job's `targetA` differing from the target queried. Used by `SweepManager` to re-queue that target once instead of dropping it.
 
 **PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity.
 

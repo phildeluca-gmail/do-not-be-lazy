@@ -387,6 +387,19 @@ namespace DoNotBeLazy.Patches
                 {
                     try
                     {
+                        // sow-only zone gates (allow sow, hydroponics power)
+                        // that live in ExtraRequirements and never run here
+                        if (!GrowerCompat.SowSettingsAllow(scanner, cell, pawn.Map))
+                        {
+                            continue;
+                        }
+
+                        // clears WorkGiver_Grower's shared static so the
+                        // wanted plant is recomputed for the clicked cell -
+                        // without it the menu shows or hides the option based
+                        // on whatever unrelated scan ran last
+                        GrowerCompat.ResetWantedPlantDef(scanner);
+
                         if (scanner.HasJobOnCell(pawn, cell, true))
                         {
                             return cell;

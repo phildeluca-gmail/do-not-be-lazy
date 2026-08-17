@@ -11,6 +11,7 @@ namespace DoNotBeLazy.Core
         public float needThreshold = 0.05f;
         public float moodThreshold = 0.10f;
         public bool showSweepOverlay = true;
+        public bool verboseLogging = false;
 
         public override void ExposeData()
         {
@@ -19,6 +20,12 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref needThreshold, "needThreshold", 0.05f);
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
+            Scribe_Values.Look(ref verboseLogging, "verboseLogging", false);
+
+            // the toggle only exists to drive this - keep them in sync on
+            // load as well as on change, or a saved "on" reads as off until
+            // the settings window is opened
+            Logger.VerboseLogging = verboseLogging;
         }
 
         public void DoWindowContents(Rect inRect)
@@ -39,6 +46,11 @@ namespace DoNotBeLazy.Core
 
             listing.Gap();
             listing.CheckboxLabeled("Show sweep radius overlay on hover", ref showSweepOverlay);
+
+            listing.Gap();
+            listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,
+                "Writes a [DoNotBeLazy] trace of every sweep decision to the log. Leave off for normal play.");
+            Logger.VerboseLogging = verboseLogging;
 
             listing.End();
         }

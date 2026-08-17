@@ -23,6 +23,30 @@ namespace DoNotBeLazy.Utility
     // per WorkGiverDef as sweep types are added.
     public static class TaskScanner
     {
+        // FloatMenuPatch bails on the whole right-click if the clicked cell
+        // is on fire, but that only covers the one cell the player aimed at -
+        // a sweep radius routinely spans tiles the player never looked at.
+        // Nothing else filters fire: GrowerSow/GrowerHarvest don't check it
+        // (a scorched-but-mature plant, or a cell burnt back to bare ground,
+        // still passes HasJobOnCell), and vanilla's own fire guards live in
+        // PotentialWorkCellsGlobal, which this mod never calls.
+        //
+        // Deliberate divergence from vanilla: vanilla skips an *entire* grow
+        // zone when it contains static fire (Zone_Growing.ContainsStaticFire).
+        // Filtering per target instead means the unburnt part of a field is
+        // still workable, which is better behaviour for an explicit player
+        // order, and avoids re-walking every zone cell once per scanned cell.
+        public static bool TargetIsBurning(LocalTargetInfo target, Map map)
+        {
+            if (target.HasThing)
+            {
+                Thing thing = target.Thing;
+                return thing != null && (thing.IsBurning() || thing.Position.ContainsStaticFire(map));
+            }
+
+            return target.Cell.ContainsStaticFire(map);
+        }
+
         public static List<LocalTargetInfo> FindTargets(IntVec3 center, int radius, Map map, WorkGiverDef workGiverDef, Pawn forPawn)
         {
             var results = new List<LocalTargetInfo>();
@@ -40,6 +64,10 @@ namespace DoNotBeLazy.Utility
             float radiusSquared = radius * radius;
             Area allowedArea = forPawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
 
+            // one line per scan rather than per cell - a radius-16 scan
+            // touches ~800 cells and per-cell logging would bury the signal
+            int before = results.Count;
+
             // scanCells and scanThings aren't mutually exclusive on the def,
             // so both branches can contribute to the same pool
             if (workGiverDef.scanCells)
@@ -52,6 +80,7 @@ namespace DoNotBeLazy.Utility
                 ScanThings(center, radiusSquared, map, scanner, forPawn, allowedArea, results);
             }
 
+            Core.Logger.Message($"scan {workGiverDef.defName} r={radius} at {center} for {forPawn.LabelShort}: {results.Count - before} targets");
             return results;
         }
 
@@ -83,6 +112,29 @@ namespace DoNotBeLazy.Utility
                 {
                     continue;
                 }
+
+                if (TargetIsBurning(cell, map))
+                {
+                    continue;
+                }
+
+                // zone "allow sow" / hydroponics power - lives in
+                // WorkGiver_GrowerSow.ExtraRequirements, which only
+                // PotentialWorkCellsGlobal calls, so we apply it ourselves
+                if (!GrowerCompat.SowSettingsAllow(scanner, cell, map))
+                {
+                    continue;
+                }
+
+                if (!GrowerCompat.CanReachTarget(forPawn, cell, scanner))
+                {
+                    continue;
+                }
+
+                // must precede HasJobOnCell - clears WorkGiver_Grower's
+                // shared static so vanilla recomputes the wanted plant for
+                // THIS cell (which is also what rejects unzoned cells)
+                GrowerCompat.ResetWantedPlantDef(scanner);
 
                 // forced:true - matches how a manually-issued order behaves
                 // in vanilla (e.g. bypasses ignoreOtherReservations-style
@@ -141,7 +193,17 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
+                if (TargetIsBurning(thing, map))
+                {
+                    continue;
+                }
+
                 if (!map.reservationManager.CanReserve(forPawn, thing))
+                {
+                    continue;
+                }
+
+                if (!GrowerCompat.CanReachTarget(forPawn, thing, scanner))
                 {
                     continue;
                 }
