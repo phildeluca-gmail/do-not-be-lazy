@@ -1,14 +1,158 @@
-<!-- Updated: 2026-08-17 EDT - first verified in-game sweep, need-pause loop found -->
+<!-- Updated: 2026-08-18 EDT - fire sweeps, need-pause loop fixed, no-target feedback -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-17)
+## 0. Current Status (2026-08-18)
 
 Phases 1-3 are implemented, an Opus compatibility/correctness pass has
 been run over the Phase 3 files, and the project builds clean (`dotnet
 build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
 mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
+
+**NEW (2026-08-18): `* Fight fires until done` - group firefighting, with
+vanilla's home-area restriction deliberately overridden.** Reported as
+"cannot group-select to put out fires." Three separate gates were
+stopping it, all of them deliberate at the time:
+
+- `FightFires` is `directOrderable: false` in vanilla (confirmed in
+  `Data/Core/Defs/WorkGiverDefs/WorkGivers.xml`), and `IsSweepEligible`
+  rejects on exactly that flag - a rule added earlier precisely so we
+  wouldn't have to denylist non-orderable defs one at a time.
+- `FloatMenuPatch.Build` bailed out of the *entire* right-click when a
+  `Fire` was on the clicked cell, on the reasoning that nothing we offer
+  is sensible to send pawns into on a burning tile. True for everything
+  we offered at the time; it also made the one sensible option
+  impossible.
+- `TaskScanner.TargetIsBurning` filters every burning target out of the
+  pool, and a `Fire` *is* the burning thing, so even a firefighting
+  sweep would have scanned up an empty pool.
+
+All three now have a firefighting exemption, keyed on
+`workType.defName == "Firefighter"` rather than on the `FightFires`
+defName, so a modded firefighting WorkGiver gets the same treatment.
+`Build` no longer bails on fire: when the clicked cell holds a `Fire` it
+offers the fire sweep **and nothing else** - the original "don't send
+pawns into a burning tile" reasoning still holds for every other def.
+
+**Deliberate divergence from vanilla, per explicit user decision:** the
+home-area restriction is overridden. `WorkGiver_FightFires.HasJobOnThing`
+refuses any fire whose position isn't in `pawn.Map.areaManager.Home`
+(for fires not attached to a pawn) - that gate is why auto-firefighting
+ignores wildfires. Since the player is explicitly clicking the fire, we
+bypass it. `JobOnThing` has no gate of its own (its whole body is
+`return new Job(JobDefOf.BeatFire, t)`), so the override is entirely a
+matter of not calling `HasJobOnThing` - hence `FireCompat.HasFireJob`,
+which re-implements the rest of vanilla's checks and drops only the home
+-area one. What it keeps, verified against the decompiled source:
+
+- fire attached to a pawn: never the pawn's own fire, and the attached
+  pawn must be reachable
+- `WorkTags.Firefighting` disabled on the pawn
+- the reservation check vanilla only applies past 15 tiles
+- `FireIsBeingHandled` - re-implemented rather than called, because
+  `WorkGiver_FightFires` is `internal` and the helper is unreachable
+  from our assembly even though it's `public static` on it. This is what
+  makes a group fan out instead of piling on one fire: a fire with a
+  respected reserver standing within 5 tiles counts as handled.
+- reachability to the fire itself (the framework's usual filter, which
+  we skip by calling `HasJob*` directly - same bypass class as the whole
+  `Potential*Global` lesson below)
+
+**Open, and deliberately not changed while the decision was
+unavailable: drafted pawns are still excluded from fire sweeps.**
+`FightFires` is `canBeDoneWhileDrafted: true` with
+`autoTakeablePriorityDrafted: 20`, so vanilla explicitly does let
+drafted pawns fight fires, and "fire breaks out mid-raid" is a real use
+case. Including them would need a per-WorkGiver exception in *two*
+places - `PawnValidator.CanSweep` (rejects `pawn.Drafted`) and
+`SweepManager.MapComponentTick` (drops a pawn from the sweep the moment
+they're drafted) - which is a structural exception to a rule the whole
+codebase currently holds uniformly, and section 4's drafted-pawn edge
+case states outright. Left consistent for now. **Undraft before ordering
+a fire sweep.** Revisit on request.
+
+Fires spread, so a fire sweep is the first sweep type where a pool built
+once at `BeginSweep` is actively wrong. `SweepOrder` now carries the
+scan origin and radius, and `AssignNextTask` re-scans **once** when the
+pool empties on a rescannable order (firefighting only). One rescan per
+call, guarded by a local flag - if the rescan also comes up empty the
+sweep ends normally, so there's no tight loop.
+
+**FIXED (2026-08-18): the need pause/resume loop.** The bug documented
+below on 2026-08-17 - a pawn paused for a critical need after every
+single task instead of pausing once, eating, and coming back. Two
+distinct symptoms, one root cause, and the second symptom is worse than
+what the log first showed:
+
+1. `Notify_JobEnded` consumed `pausedForNeed` on the **first** job end
+   after a pause, whatever that job was. `PauseForNeed` calls
+   `EndCurrentJob(InterruptForced)`, which defaults `startNewJob: true`,
+   so vanilla's think tree immediately starts *something*; when that
+   ended we resumed and yanked the pawn off a meal they'd only just
+   started walking to.
+2. Once the flag was spent, the pawn was no longer "paused" - so the
+   *next* interrupt, which is usually the genuine one (vanilla forcing
+   them to go eat), arrived at `Notify_JobEnded` unpaused, hit
+   `TargetFailureIsRecoverable(InterruptForced)` = false, and
+   `RemoveSweep`d the order outright. That is the "they take a break and
+   never come back" report: the sweep isn't paused at that point, it's
+   gone.
+
+Fix: resumption is now gated on the need actually being satisfied, not
+on a job ending. `Notify_JobEnded` re-checks the pawn's needs while
+paused and **stays** paused if any is still under threshold, without
+touching the failure counter or ending the sweep. `NeedMonitor`'s
+existing `IsPaused` guard then does the rest - a paused pawn is never
+re-interrupted, so the 60-tick re-pause loop can't form.
+
+Resumption uses **hysteresis**: `NeedMonitor.ResumeMargin` (0.05, i.e.
+5 percentage points of `CurLevelPercentage`) above the pause threshold.
+Without it a need hovering exactly at the threshold thrashes - resume,
+drop a hair, re-pause, one job interrupt per cycle. Mood is the case
+that actually needs this; food and rest jump well clear on their own.
+
+Bounded by `MaxPauseTicks` (30,000 ticks, half an in-game day). A need
+that never recovers - a mood that stays under threshold - would
+otherwise hold a paused sweep and its share of the pool forever. On
+expiry the sweep ends with a log line rather than hanging.
+
+**NEW (2026-08-18): the menu now says *why* a sweep isn't on offer.**
+Requested after several "I told them to haul and nothing happened"
+reports (stone blocks, wood) that each cost a session to chase and each
+turned out to be a stockpile filter, not a mod bug. Previously a def
+that found no target was silently skipped, so "no option" and "option
+that does nothing" looked identical from the player's side.
+
+Modelled directly on vanilla's own `FloatMenuMakerMap.AddJobGiverWorkOrders`,
+which is where RimWorld already solves this problem - read from the
+decompiled source rather than invented:
+
+- `Verse.AI.JobFailReason` is a static the WorkGivers write into while
+  answering `HasJobOn*`. `JobFailReason.Clear()` before the probe,
+  `JobFailReason.HaveReason` / `.Reason` after. `HaulAIUtility` sets it
+  for every haul refusal path there is - forbidden, forbidden outside
+  allowed area, reserved for prisoners, burning, and
+  `NoEmptyPlaceLower` ("no empty place to put it"), which is the exact
+  answer to the stone-blocks and wood reports.
+- The failing option is added **disabled** (null action, `Disabled` set
+  explicitly), labelled with vanilla's own `CannotGenericWork` key plus
+  the reason in parentheses, so wording and translation match the base
+  game.
+- Scoped the way vanilla scopes it, which is what keeps the menu from
+  filling with thirty greyed-out entries: only defs whose own
+  `PotentialWorkThingRequest.Accepts(thing)` is true for something on
+  the clicked cell are candidates, and of those, only ones that actually
+  produced a reason get an entry. No reason means no entry.
+- Capped at `MaxFeedbackOptions` (3) regardless, and only shown when no
+  live `*` option was produced for that def.
+
+Second surface, for the case where the option *was* offered and the
+sweep still started empty (the clicked target had a job but the radius
+scan came back with nothing): `BeginAreaSweep` now raises a
+`Messages.Message(..., MessageTypeDefOf.RejectInput)`. The float menu is
+already gone by then, so a message is the only channel left. Between the
+two, a sweep that does nothing should no longer be silent.
 
 **First verified-working sweep (2026-08-17).** A `HaulMerge` sweep ran
 end to end in a real save - 30 targets found, jobs handed out, pool
@@ -18,7 +162,9 @@ analysis only** - none of the `GrowerSow` work has been exercised yet.
 A 26-test playtest plan covering it is published at
 `https://claude.ai/code/artifact/e60cfd11-1f82-46a8-9111-a25d9352a2dd`.
 
-**BUG, FOUND NOT FIXED (2026-08-17): the need pause/resume loop.** The
+**BUG, FOUND 2026-08-17 - FIXED 2026-08-18 (see the entry above for the
+fix; this entry is kept for the diagnosis): the need pause/resume loop.**
+The
 same log showed a pawn being paused for a critical need after *every
 single task* of a haul sweep - three tasks, three pauses - rather than
 pausing once, eating, and resuming.
@@ -42,7 +188,9 @@ annotated in place; do not re-derive this.
 
 Likely fix, **not implemented and not yet agreed**: re-check the need on
 resume and stay paused while it remains under threshold. Per CLAUDE.md
-that needs a decision and a doc edit before any code.
+that needs a decision and a doc edit before any code. **Implemented
+2026-08-18, essentially as described, plus hysteresis and a give-up
+bound - see the 2026-08-18 entry.**
 
 **Diagnostic gap found the same day: the float-menu path is entirely
 untraced.** `AddConsumeOption`, `FindTargetWithJob`, `IsSweepEligible`
@@ -513,7 +661,11 @@ A RimWorld 1.5 mod that adds area-sweep task commands to the right-click context
 - Mining: one pawn per cell. Sweep assigns each pawn to a separate unreserved minable cell within radius.
 - Cleaning/other: one pawn per cell. Same as mining - fan out to distinct unreserved cells.
 
-**Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick. **This last sentence is WRONG - corrected 2026-08-17, see section 0.** The bouncing does happen: a genuine job-end event is not the same as the need being satisfied, and a real log shows a pawn paused after every task of a sweep. Not yet fixed.
+**Need interrupts:** A tick-level check monitors hunger, recreation, sleep (`needThreshold`, default 5%) and mood (`moodThreshold`, its own separate default 10%). When any drops to threshold or below, the pawn's forced job is cleared and they path to satisfy that need. **Updated 2026-08-15, reversing the original design below:** they now DO return to the last-ordered work automatically once that need-driven job finishes on its own (`SweepManager.PauseForNeed` / section 3.2) - a cooking pawn who gets tired pauses, sleeps, and resumes cooking. Interrupt-loop risk (the original reason for not auto-resuming) doesn't reappear because resumption only fires on a genuine job-end event, not a repeated need poll - a pawn can't get stuck bouncing between "resume" and "immediately re-interrupt" every tick. **This last sentence is WRONG - corrected 2026-08-17, see section 0.** The bouncing does happen: a genuine job-end event is not the same as the need being satisfied, and a real log shows a pawn paused after every task of a sweep. **Fixed 2026-08-18:** a job end is now only the *trigger* to re-check; the pawn stays paused until the need is genuinely back above threshold plus a 5-point margin, and a sweep that stays paused past `MaxPauseTicks` (half an in-game day) ends rather than hanging. See section 0.
+
+**Firefighting (added 2026-08-18):** right-clicking a `Fire` offers `* Fight fires until done` and nothing else - every other sweep type is suppressed on a burning tile, which is the pre-existing rule, but firefighting itself is now offered rather than the whole click being dropped. Vanilla's home-area restriction on firefighting is deliberately overridden for this explicit player order; drafted pawns are still excluded, as they are from every other sweep. Fire sweeps re-scan once when their pool empties, since fires spread. Details in section 0 and `FireCompat` in 3.2.
+
+**Feedback when nothing is available (added 2026-08-18):** if a sweep-eligible WorkGiver plausibly applies to the clicked thing but has no job for it, a **disabled** `* ...` entry is added stating the reason vanilla itself gives (`JobFailReason`), e.g. hauling with no stockpile that accepts the item. Capped at three such entries, and only when a reason actually exists. If a sweep starts but the radius scan finds nothing, a rejected-input message says so.
 
 ## 3. Technical Architecture
 
@@ -544,6 +696,7 @@ DoNotBeLazy/
         TaskScanner.cs             # Radius search, task matching
         PawnValidator.cs           # Permission/capability checks
         GrowerCompat.cs            # WorkGiver_Grower static-state + sow gates
+        FireCompat.cs              # FightFires detection, home-area override
 ```
 
 ### 3.2 Component Descriptions
@@ -589,6 +742,30 @@ Filters out tasks already claimed by another pawn via the normal reservation sys
 - `SowSettingsAllow(cell, map)` - the `ExtraRequirements` gates that resetting the static does *not* restore: `IPlantToGrowSettable.CanAcceptSowNow()` and `Zone_Growing.allowSow`. Applied to `WorkGiver_GrowerSow` only; `GrowerHarvest` has no `ExtraRequirements` override to mirror.
 - `IsPreparatoryJob(job, target)` - true when a WorkGiver returned a blocker-clearing job (`CutPlant`, `HaulAside`) rather than the work asked for, detected by the job's `targetA` differing from the target queried. Used by `SweepManager` to re-queue that target once instead of dropping it.
 
+**FireCompat.cs** (added 2026-08-18) - Static utility, same shape and
+purpose as `GrowerCompat`: the things we have to do by hand because we
+call `HasJobOnThing` directly, plus the one vanilla check we deliberately
+drop. Three responsibilities:
+
+- `IsFirefighting(def)` - `workType.defName == "Firefighter"`, not a
+  `FightFires` defName match, so modded firefighting WorkGivers get the
+  same handling. This is the flag the exemptions in `FloatMenuPatch`
+  (`directOrderable`, the burning-cell bail-out) and `TaskScanner` /
+  `SweepManager` (`TargetIsBurning`) all key off.
+- `HasFireJob(pawn, thing, forced)` - stands in for
+  `WorkGiver_FightFires.HasJobOnThing`, keeping its pawn-attached-fire
+  rules, `WorkTags.Firefighting`, the past-15-tiles reservation check and
+  reachability, and **dropping the home-area gate** per the user's
+  explicit decision (section 0). Note the worker class is `internal`, so
+  neither the type nor its `public static FireIsBeingHandled` can be
+  referenced from this assembly - the latter is re-implemented here
+  (`FirstRespectedReserver` within 5 tiles), which is also what stops a
+  whole group piling onto one fire.
+- `JobOnThing` is **not** wrapped: its entire vanilla body is
+  `return new Job(JobDefOf.BeatFire, t)`, and we hold the scanner as a
+  `WorkGiver_Scanner`, so the normal virtual call already does the right
+  thing.
+
 **PawnValidator.cs** - Static utility. Given a pawn and a `WorkGiverDef`, returns bool for whether the pawn can perform that work type. Checks: dead/downed/mental-state/drafted, work type enabled and active in the pawn's work settings, Manipulation capacity.
 
 **JobDriver_AreaSweep.cs** - Not written; turned out to be unnecessary. Workstation "stop after one bill" is overridden without a custom JobDriver: `JobTrackerPatch`'s postfix on `EndCurrentJob` checks if the ending job was `JobDefOf.DoBill` on a sweep's bill giver, and if so directly asks the `WorkGiver_Scanner` for another job on that same giver before falling through to `SweepManager`. `SweepManager` otherwise issues the same vanilla `Job` the float menu would have created, chained sequentially via `Notify_JobEnded`.
@@ -619,7 +796,7 @@ Filters out tasks already claimed by another pawn via the normal reservation sys
 - **Reservation compliance:** Vanilla reservation system is respected, not overridden. `TaskScanner` filters out reserved targets via `map.reservationManager.CanReserve()`. For workstations, only the highest-skilled pawn in the selection is assigned; others are skipped for that task type.
 - **Workstation bill depletion:** Bills can require materials. If materials run out mid-sweep, the pawn should gracefully exit the sweep rather than idle at the station.
 - **Save/Load:** `SweepManager` should implement `ExposeData()` to persist active sweeps across saves, or clear them on load (simpler, recommended for v1).
-- **Drafted pawns in selection:** If any selected pawns are drafted, exclude them from sweep assignment. Do not undraft them automatically.
+- **Drafted pawns in selection:** If any selected pawns are drafted, exclude them from sweep assignment. Do not undraft them automatically. **Open question as of 2026-08-18:** firefighting is the one case where vanilla disagrees - `FightFires` is `canBeDoneWhileDrafted: true` with `autoTakeablePriorityDrafted: 20`, and a fire during a raid is exactly when the player has everyone drafted. Currently still excluded, for consistency; changing it means a per-WorkGiver exception in both `PawnValidator.CanSweep` and `SweepManager.MapComponentTick`. Awaiting a decision.
 - **Pawn death/downed/mental break mid-sweep:** SweepManager must detect these state changes on tick and remove the pawn from active sweeps. Check `pawn.Dead`, `pawn.Downed`, `pawn.InMentalState`.
 - **Forbidden targets:** TaskScanner must check `thing.IsForbidden(pawn)` before including a target. Forbidden items/buildings are skipped.
 - **Area restrictions:** Pawns with allowed-area restrictions may not be permitted to path to some tasks within the 16-tile radius. TaskScanner must check `pawn.Map.areaManager` and the pawn's allowed area before assigning.

@@ -23,17 +23,30 @@ namespace DoNotBeLazy.Components
         public List<LocalTargetInfo> SharedPool { get; }
         public Thing WorkstationTarget { get; }
 
+        // Where the pool was scanned from, kept so a rescannable order can
+        // build a fresh one. Fires spread, so a fire sweep with a pool
+        // frozen at BeginSweep time goes stale almost immediately - it's the
+        // first sweep type where "until done" means more than "until this
+        // list is empty". Nothing else rescans.
+        public IntVec3 ScanCenter { get; }
+        public int ScanRadius { get; }
+        public bool Rescannable { get; }
+
         // Targets already put back in the pool once after the WorkGiver
         // answered with blocker-clearing work instead of the task itself.
         // Capped at one re-queue each: a cell that can never be satisfied
         // would otherwise hand out the same preparatory job forever.
         public HashSet<LocalTargetInfo> Requeued { get; } = new HashSet<LocalTargetInfo>();
 
-        public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null)
+        public SweepOrder(WorkGiverDef workGiverDef, List<LocalTargetInfo> sharedPool, Thing workstationTarget = null,
+            IntVec3 scanCenter = default(IntVec3), int scanRadius = 0, bool rescannable = false)
         {
             WorkGiverDef = workGiverDef;
             SharedPool = sharedPool;
             WorkstationTarget = workstationTarget;
+            ScanCenter = scanCenter;
+            ScanRadius = scanRadius;
+            Rescannable = rescannable;
         }
     }
 
@@ -67,6 +80,11 @@ namespace DoNotBeLazy.Components
         // "this sweep isn't going to work" rather than "unlucky target".
         private const int MaxConsecutiveFailures = 8;
 
+        // A pawn whose need never climbs back over the threshold - a mood
+        // that just stays low - would otherwise hold a paused sweep, and its
+        // share of the shared pool, forever. Half an in-game day.
+        private const int MaxPauseTicks = 30000;
+
         private readonly Dictionary<Pawn, SweepOrder> activeSweeps = new Dictionary<Pawn, SweepOrder>();
 
         // Per-pawn, not per-order: a SweepOrder is shared across everyone in
@@ -77,8 +95,12 @@ namespace DoNotBeLazy.Components
         // pawns pulled out of their sweep job for a critical need but still
         // tracked in activeSweeps - NeedMonitor adds them here via
         // PauseForNeed instead of RemoveSweep, so the sweep can resume once
-        // whatever job vanilla AI gives them (eat/sleep/joy) ends on its own
-        private readonly HashSet<Pawn> pausedForNeed = new HashSet<Pawn>();
+        // the need is actually dealt with. Value is the tick they were
+        // paused on, for the MaxPauseTicks give-up.
+        //
+        // (was a HashSet, and resumption was "first job end after a pause
+        // wins". That's the bug - see Notify_JobEnded.)
+        private readonly Dictionary<Pawn, int> pausedForNeed = new Dictionary<Pawn, int>();
 
         // TryTakeOrderedJob interrupts whatever the pawn is doing right now,
         // and that fires EndCurrentJob(InterruptForced) -> JobTrackerPatch's
@@ -145,7 +167,7 @@ namespace DoNotBeLazy.Components
 
         public bool IsPaused(Pawn pawn)
         {
-            return pausedForNeed.Contains(pawn);
+            return pausedForNeed.ContainsKey(pawn);
         }
 
         // Called by NeedMonitor when a swept pawn's need goes critical.
@@ -163,7 +185,7 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            pausedForNeed.Add(pawn);
+            pausedForNeed[pawn] = Find.TickManager.TicksGame;
 
             if (pawn.jobs?.curJob == null)
             {
@@ -292,16 +314,30 @@ namespace DoNotBeLazy.Components
             // happens to be first - fine since the checks it applies
             // (forbidden, reservable, radius) don't vary by which pawn asked
             Pawn driver = eligiblePawns[0];
-            List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, DoNotBeLazyMod.Settings.sweepRadius, map, workGiverDef, driver);
+            int radius = DoNotBeLazyMod.Settings.sweepRadius;
+            List<LocalTargetInfo> pool = TaskScanner.FindTargets(clickCell, radius, map, workGiverDef, driver);
             if (pool.Count == 0)
             {
+                // the clicked target had a job or the option wouldn't have
+                // been offered, so an empty pool here means the radius scan
+                // disagreed with the click - reservations, reachability,
+                // allowed area. Silence on this used to look identical to
+                // "the mod is broken"; the float menu is already gone by
+                // now, so a message is the only channel left.
                 Logger.Message($"BeginSweep {workGiverDef.defName}: scan found nothing, no sweep started");
+                string what = workGiverDef.label.NullOrEmpty() ? workGiverDef.defName : workGiverDef.label.CapitalizeFirst();
+                Messages.Message(
+                    "* " + what + ": nothing to do within " + radius + " tiles.",
+                    new TargetInfo(clickCell, map),
+                    MessageTypeDefOf.RejectInput,
+                    false);
                 return;
             }
 
             Logger.Message($"BeginSweep {workGiverDef.defName}: {pool.Count} targets, {eligiblePawns.Count} pawns");
 
-            var order = new SweepOrder(workGiverDef, pool);
+            // fire sweeps rescan when the pool runs dry, nothing else does
+            var order = new SweepOrder(workGiverDef, pool, null, clickCell, radius, FireCompat.IsFirefighting(workGiverDef));
 
             foreach (Pawn pawn in eligiblePawns)
             {
@@ -326,13 +362,34 @@ namespace DoNotBeLazy.Components
             // wandered off" reports are almost always answered by this line
             Logger.Message($"{pawn.LabelShort}: job ended {condition} ({order.WorkGiverDef.defName})");
 
-            if (pausedForNeed.Remove(pawn))
+            if (pausedForNeed.TryGetValue(pawn, out int pausedAt))
             {
-                // this wasn't a sweep task ending - it's the pawn's own
-                // need-driven job (eat/sleep/joy) wrapping up on its own.
-                // Resume regardless of how it ended (succeeded, or
-                // interrupted by something else entirely) - if they're free
-                // again, they go back to the last-ordered work.
+                // This is NOT a sweep task ending - the pawn is off dealing
+                // with a need. Used to resume right here, on the first job
+                // end after the pause, whatever that job was. Which is
+                // wrong twice over: EndCurrentJob starts a replacement job
+                // immediately, so the first thing to end is usually that
+                // replacement rather than a meal, and the pawn got dragged
+                // back mid-break; and once the flag was gone the next real
+                // interrupt fell through to the InterruptForced branch
+                // below and killed the sweep for good. That's the "takes a
+                // break and never comes back" report.
+                //
+                // A job end is only a prompt to look again now.
+                if (!NeedMonitor.NeedsSatisfied(pawn))
+                {
+                    if (Find.TickManager.TicksGame - pausedAt > MaxPauseTicks)
+                    {
+                        // need isn't recovering (a mood that just stays
+                        // low). Don't hold the pool hostage over it.
+                        Logger.Message($"{pawn.LabelShort}: still under threshold after {MaxPauseTicks} ticks paused, ending sweep.");
+                        RemoveSweep(pawn);
+                    }
+                    return;
+                }
+
+                pausedForNeed.Remove(pawn);
+                Logger.Message($"{pawn.LabelShort}: needs satisfied, resuming sweep ({order.WorkGiverDef.defName})");
                 AssignNextTask(pawn, order);
                 return;
             }
@@ -435,8 +492,30 @@ namespace DoNotBeLazy.Components
                 return;
             }
 
-            while (order.SharedPool.Count > 0)
+            bool firefighting = FireCompat.IsFirefighting(order.WorkGiverDef);
+            bool rescanned = false;
+
+            while (true)
             {
+                if (order.SharedPool.Count == 0)
+                {
+                    // fires spread - a pool frozen at BeginSweep time is out
+                    // of date by the time the first one is out. Once per
+                    // call, so an order that genuinely has nothing left
+                    // still ends instead of spinning.
+                    if (!order.Rescannable || rescanned)
+                    {
+                        break;
+                    }
+
+                    rescanned = true;
+                    order.SharedPool.AddRange(TaskScanner.FindTargets(order.ScanCenter, order.ScanRadius, map, order.WorkGiverDef, pawn));
+                    if (order.SharedPool.Count == 0)
+                    {
+                        break;
+                    }
+                }
+
                 // pull by index - Remove(target) on a struct list was doing a
                 // linear equality scan for something we'd just found the
                 // position of
@@ -444,7 +523,7 @@ namespace DoNotBeLazy.Components
                 LocalTargetInfo target = order.SharedPool[i];
                 order.SharedPool.RemoveAt(i);
 
-                if (!TargetStillValid(pawn, target, scanner))
+                if (!TargetStillValid(pawn, target, scanner, firefighting))
                 {
                     continue;
                 }
@@ -492,14 +571,15 @@ namespace DoNotBeLazy.Components
         // (allowed area, reachability) or drift while the sweep runs (the
         // target getting destroyed, forbidden, reserved, or its zone's sow
         // toggle being switched off mid-sweep).
-        private bool TargetStillValid(Pawn pawn, LocalTargetInfo target, WorkGiver_Scanner scanner)
+        private bool TargetStillValid(Pawn pawn, LocalTargetInfo target, WorkGiver_Scanner scanner, bool firefighting)
         {
             Area allowed = pawn.playerSettings?.AreaRestrictionInPawnCurrentMap;
 
             // checked for both target kinds up front: a fire that starts
             // after the pool was built is exactly the case the scan-time
-            // filter can't catch, and a sweep can run for a long while
-            if (TaskScanner.TargetIsBurning(target, map))
+            // filter can't catch, and a sweep can run for a long while.
+            // Obviously exempt when the fire is the point.
+            if (!firefighting && TaskScanner.TargetIsBurning(target, map))
             {
                 return false;
             }

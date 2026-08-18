@@ -77,7 +77,7 @@ namespace DoNotBeLazy.Utility
 
             if (workGiverDef.scanThings)
             {
-                ScanThings(center, radiusSquared, map, scanner, forPawn, allowedArea, results);
+                ScanThings(center, radiusSquared, map, workGiverDef, scanner, forPawn, allowedArea, results);
             }
 
             Core.Logger.Message($"scan {workGiverDef.defName} r={radius} at {center} for {forPawn.LabelShort}: {results.Count - before} targets");
@@ -153,8 +153,12 @@ namespace DoNotBeLazy.Utility
         // construction and bills included. Iterating that straight was an
         // NRE. Vanilla's JobGiver_Work does the same thing we do here: fall
         // back to the thing lister.
-        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results)
+        private static void ScanThings(IntVec3 center, float radiusSquared, Map map, WorkGiverDef workGiverDef, WorkGiver_Scanner scanner, Pawn forPawn, Area allowedArea, List<LocalTargetInfo> results)
         {
+            // the burning-target filter below would throw out every single
+            // candidate here - the target IS the fire
+            bool firefighting = FireCompat.IsFirefighting(workGiverDef);
+
             IEnumerable<Thing> candidates = scanner.PotentialWorkThingsGlobal(forPawn);
             if (candidates == null)
             {
@@ -193,7 +197,7 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (TargetIsBurning(thing, map))
+                if (!firefighting && TargetIsBurning(thing, map))
                 {
                     continue;
                 }
@@ -208,7 +212,12 @@ namespace DoNotBeLazy.Utility
                     continue;
                 }
 
-                if (!scanner.HasJobOnThing(forPawn, thing, true))
+                // HasFireJob is vanilla's own check minus the home-area
+                // gate - see FireCompat
+                bool hasJob = firefighting
+                    ? FireCompat.HasFireJob(forPawn, thing, true)
+                    : scanner.HasJobOnThing(forPawn, thing, true);
+                if (!hasJob)
                 {
                     continue;
                 }

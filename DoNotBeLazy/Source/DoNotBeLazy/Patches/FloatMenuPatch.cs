@@ -50,6 +50,12 @@ namespace DoNotBeLazy.Patches
             "Mining",
             "Growing",
             "PlantCutting",
+            // Firefighting is a special case - FightFires is
+            // directOrderable:false so IsSweepEligible short-circuits on
+            // FireCompat.IsFirefighting before this set is ever consulted.
+            // Listed anyway so the supported set reads as the real answer to
+            // "what work types does this mod sweep".
+            "Firefighter",
         };
 
         // CookFillHopper (workType Hauling, vanilla defName) matches on any
@@ -81,6 +87,10 @@ namespace DoNotBeLazy.Patches
         // DefDatabase every time the menu opens. def.Worker instantiates the
         // worker, so doing it per click on a 200-def modlist is wasted work.
         private static List<WorkGiverDef> eligibleDefs;
+
+        // ceiling on the greyed-out "why not" entries. Three is enough to
+        // explain a click; thirty would be a wall of grey nobody reads.
+        private const int MaxFeedbackOptions = 3;
 
         // 1 pawn selected
         [HarmonyPatch(typeof(FloatMenuMakerMap), nameof(FloatMenuMakerMap.ChoicesAtFor))]
@@ -160,20 +170,36 @@ namespace DoNotBeLazy.Patches
             // itself, not a Thing on it) and neither checks for fire - a
             // burning farm tile with a scorched-but-still-mature plant on
             // it, or one already burnt down to bare ground, still passes
-            // HasJobOnCell. Bail on the whole click rather than special-case
-            // each WorkGiverDef: nothing we offer is sensible to send pawns
-            // into while it's on fire. Firefighting itself needs no manual
-            // order - it's emergency/auto-taken (see IsSweepEligible).
+            // HasJobOnCell. So a burning cell still suppresses every other
+            // sweep type rather than special-casing each WorkGiverDef.
+            //
+            // It used to bail on the whole click. Now it flips to
+            // firefighting-only instead: "cannot group-select to put out
+            // fires" was the exact thing that early return made impossible.
+            bool fireHere = false;
             foreach (Thing thing in thingsHere)
             {
                 if (thing is Fire)
                 {
-                    return;
+                    fireHere = true;
+                    break;
                 }
             }
 
+            // disabled "here's why you can't" entries, collected as we go
+            // and appended after the real options so they sort last
+            var feedback = new List<FloatMenuOption>();
+
             foreach (WorkGiverDef def in EligibleDefs())
             {
+                // burning cell -> firefighting and nothing else; anywhere
+                // else -> everything except firefighting, since there's no
+                // fire to fight
+                if (fireHere != FireCompat.IsFirefighting(def))
+                {
+                    continue;
+                }
+
                 List<Pawn> eligiblePawns = EligiblePawns(pawns, map, def);
                 if (eligiblePawns.Count == 0)
                 {
@@ -181,9 +207,13 @@ namespace DoNotBeLazy.Patches
                 }
 
                 var scanner = (WorkGiver_Scanner)def.Worker;
-                LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere);
+                LocalTargetInfo target = FindTargetWithJob(eligiblePawns, def, scanner, cell, thingsHere, out string failReason, out Thing failThing);
                 if (!target.IsValid)
                 {
+                    if (failReason != null && feedback.Count < MaxFeedbackOptions)
+                    {
+                        feedback.Add(DisabledOption(def, failThing, failReason));
+                    }
                     continue;
                 }
 
@@ -207,7 +237,37 @@ namespace DoNotBeLazy.Patches
                     MenuOptionPriority.Low));
             }
 
-            AddConsumeOption(pawns, map, thingsHere, options);
+            options.AddRange(feedback);
+
+            // eating off a burning tile is the same bad idea as everything
+            // else on it
+            if (!fireHere)
+            {
+                AddConsumeOption(pawns, map, thingsHere, options);
+            }
+        }
+
+        // Greyed-out entry explaining why a sweep isn't on offer. Vanilla
+        // does exactly this in AddJobGiverWorkOrders - a null action makes
+        // the option unclickable, and Disabled greys it. Worth the noise:
+        // "I ordered a haul and nothing happened" has cost two sessions
+        // now, and both times the answer was a stockpile filter that
+        // vanilla could have told us about all along.
+        //
+        // Reason text comes from JobFailReason, so it's the game's own
+        // wording, already translated.
+        private static FloatMenuOption DisabledOption(WorkGiverDef def, Thing thing, string reason)
+        {
+            string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
+            string what = thing != null ? thing.LabelShort + ": " : "";
+
+            return new FloatMenuOption(
+                "* " + label + " until done - " + what + reason,
+                null,
+                MenuOptionPriority.Low)
+            {
+                Disabled = true,
+            };
         }
 
         // Eating/drugs aren't WorkGiver-based at all - there's no WorkGiverDef
@@ -346,6 +406,12 @@ namespace DoNotBeLazy.Patches
             {
                 return false;
             }
+            // firefighting jumps the directOrderable check below - it's the
+            // one non-orderable def we deliberately want, see FireCompat
+            if (FireCompat.IsFirefighting(def))
+            {
+                return def.Worker is WorkGiver_Scanner;
+            }
             // directOrderable defaults true and is only set false on defs
             // vanilla deliberately keeps out of the player's hands - e.g.
             // FightFires (emergency-only, auto-taken by any idle pawn
@@ -379,8 +445,19 @@ namespace DoNotBeLazy.Patches
         // JobOnCell threads forced straight into its reservation check
         // (ignoreOtherReservations), so leaving it false was silently
         // failing sow/harvest on perfectly valid cells.
-        private static LocalTargetInfo FindTargetWithJob(List<Pawn> pawns, WorkGiverDef def, WorkGiver_Scanner scanner, IntVec3 cell, List<Thing> thingsHere)
+        //
+        // failReason/failThing come back set when no target was found but
+        // some WorkGiver had something to say about why - that's what the
+        // greyed-out feedback entries are built from. Only filled in for
+        // the scanThings branch: a cell-scanned def refusing an ordinary
+        // empty tile is the normal case, not an error worth reporting, and
+        // "* Sow until done - not a growing zone" on every click of bare
+        // ground would be pure noise.
+        private static LocalTargetInfo FindTargetWithJob(List<Pawn> pawns, WorkGiverDef def, WorkGiver_Scanner scanner, IntVec3 cell, List<Thing> thingsHere, out string failReason, out Thing failThing)
         {
+            failReason = null;
+            failThing = null;
+
             if (def.scanCells)
             {
                 foreach (Pawn pawn in pawns)
@@ -414,6 +491,9 @@ namespace DoNotBeLazy.Patches
 
             if (def.scanThings)
             {
+                bool firefighting = FireCompat.IsFirefighting(def);
+                ThingRequest req = scanner.PotentialWorkThingRequest;
+
                 foreach (Thing thing in thingsHere)
                 {
                     foreach (Pawn pawn in pawns)
@@ -422,9 +502,36 @@ namespace DoNotBeLazy.Patches
                         // targets - one bad def shouldn't eat the menu
                         try
                         {
-                            if (scanner.HasJobOnThing(pawn, thing, true))
+                            // WorkGivers write their refusal into this
+                            // static while answering - clear it first or we
+                            // report whatever the previous def left behind
+                            JobFailReason.Clear();
+
+                            // firefighting goes through our own predicate,
+                            // which is vanilla's minus the home-area gate
+                            bool hasJob = firefighting
+                                ? FireCompat.HasFireJob(pawn, thing, true)
+                                : scanner.HasJobOnThing(pawn, thing, true);
+
+                            if (hasJob)
                             {
+                                failReason = null;
+                                failThing = null;
                                 return thing;
+                            }
+
+                            // req.Accepts is the scoping that keeps this
+                            // sane - without it every def in the game gets
+                            // to explain itself about every click. Vanilla
+                            // scopes its own version the same way.
+                            if (failReason == null
+                                && JobFailReason.HaveReason
+                                && !JobFailReason.Silent
+                                && !req.IsUndefined
+                                && req.Accepts(thing))
+                            {
+                                failReason = JobFailReason.Reason;
+                                failThing = thing;
                             }
                         }
                         catch

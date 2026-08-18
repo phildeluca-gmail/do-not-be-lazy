@@ -20,8 +20,19 @@ namespace DoNotBeLazy.Components
     // need-driven job finishes on its own they resume the last-ordered
     // work. This reverses the original design (see architecture doc
     // section 2 history), which cancelled outright to avoid interrupt
-    // loops; pausing avoids the same loop risk since resumption only
-    // happens on a real job-end event, not a repeated need check.
+    // loops.
+    //
+    // "resumption only happens on a real job-end event, not a repeated need
+    // check, so the interrupt loop can't come back" - that was the old
+    // comment here and it was wrong. EndCurrentJob starts a replacement job
+    // immediately, so the very next job end is usually that replacement,
+    // not the pawn eating. SweepManager resumed on it, we re-paused 60
+    // ticks later, and the pawn never got a meal. Worse, once the pause
+    // flag was spent the next genuine interrupt read as "something took
+    // this pawn" and killed the sweep outright - the reported "they take a
+    // break and never come back". Now the job end is only a trigger to
+    // re-check: SweepManager asks NeedsSatisfied below and stays paused
+    // until it's actually true.
     //
     // RimWorld auto-instantiates every non-abstract GameComponent subclass
     // with a (Game) constructor when a game is created/loaded, so this
@@ -29,6 +40,13 @@ namespace DoNotBeLazy.Components
     public class NeedMonitor : GameComponent
     {
         private const int CheckIntervalTicks = 60;
+
+        // Resume needs a bit more than the threshold that paused them, or a
+        // need sitting right on the line thrashes: resume, drop a hair,
+        // pause again, one job interrupt per cycle. Mood is the one that
+        // actually does this - food and rest jump well clear once addressed.
+        // 5 percentage points of CurLevelPercentage.
+        public const float ResumeMargin = 0.05f;
 
         public NeedMonitor(Game game)
         {
@@ -78,6 +96,21 @@ namespace DoNotBeLazy.Components
                 || NeedIsCritical(pawn.needs?.joy, threshold)
                 || NeedIsCritical(pawn.needs?.rest, threshold)
                 || NeedIsCritical(pawn.needs?.mood, moodThreshold);
+        }
+
+        // What SweepManager asks before resuming a paused pawn. Same four
+        // needs, thresholds raised by ResumeMargin - see the comment on it.
+        public static bool NeedsSatisfied(Pawn pawn)
+        {
+            if (pawn?.needs == null)
+            {
+                return true;
+            }
+
+            float threshold = DoNotBeLazyMod.Settings.needThreshold + ResumeMargin;
+            float moodThreshold = DoNotBeLazyMod.Settings.moodThreshold + ResumeMargin;
+
+            return !NeedIsCritical(pawn, threshold, moodThreshold);
         }
 
         private static bool NeedIsCritical(Need need, float threshold)
