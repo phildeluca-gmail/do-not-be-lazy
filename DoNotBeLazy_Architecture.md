@@ -1,14 +1,127 @@
-<!-- Updated: 2026-08-18 EDT (evening) - review session, no code changes; FireCompat verified against the decompile, six open review findings, new standing-still report -->
+<!-- Updated: 2026-08-20 EDT - vehicle-packing investigation, no code changes; VF hijacks the multi-select right-click, and the shared pool assumes one job per target -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-18)
+## 0. Current Status (2026-08-20)
 
 Phases 1-3 are implemented, an Opus compatibility/correctness pass has
 been run over the Phase 3 files, and the project builds clean (`dotnet
 build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
 mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
+
+**INVESTIGATION SESSION (2026-08-19/20) - no code changed.** Report from
+play: *"clicking on a vehicle being packed does not [offer] `* pack until
+done`."* Diagnosed against Vehicle Framework's own source and the shipped
+1.5 assembly. Nothing in this entry is a code change; two fixes are
+proposed at the end and **neither is approved yet**.
+
+**Root cause 1 - with 2+ pawns selected our float menu postfix never runs
+at all on a vehicle.** Not a WorkGiver problem; the menu is never built.
+Vehicle Framework prefixes `Selector.HandleMapClicks`
+(`Harmony/PatchCategories/Extra.cs:73`, `Extra.MultiSelectFloatMenu`).
+On a right-click with 2+ things selected it calls
+`SelectionHelper.MultiSelectClicker`, which - when every selected object
+is a player-faction non-vehicle `Pawn` **and** the cell under the mouse
+holds a `VehiclePawn` - calls `vehicle.MultiplePawnFloatMenuOptions()`
+and returns `true`. The prefix then returns `false`, so **vanilla
+`HandleMapClicks` never runs**, `FloatMenuMakerMap.ChoicesAtForMultiSelect`
+is never called, and neither of our postfixes fires. VF shows its own
+`FloatMenuMulti` holding exactly one entry, "Board \<vehicle\>"
+(`VehiclePawn_Rendering.cs:1166`).
+
+Consequence is wider than the report: on a group right-click on any
+vehicle, **every** `*` option disappears - pack, refuel, repair, haul,
+`* Consume`, all of it. With a **single** pawn selected VF does not
+intercept (`___selected.Count > 1` gates it), so `ChoicesAtFor` runs
+normally and the option should already appear. That asymmetry is the
+decisive test and it has not been run yet: select one colonist,
+right-click the vehicle. If the option appears there and not with a
+group, cause 1 is confirmed and complete. **If it does not appear for a
+single pawn either, cause 1 is not the whole story - keep digging before
+writing any code.**
+
+Everything on our side is already correct for this def, verified rather
+than assumed:
+
+- `PackVehicle` is `workType Hauling` (in `SupportedWorkTypeDefNames`),
+  sets no `directOrderable` so it defaults true, and is not in
+  `ExcludedDefNames`.
+- `Vehicles.WorkGiver_PackVehicle : WorkGiver_CarryToVehicle :
+  WorkGiver_Scanner` - confirmed by reflection over the shipped
+  `Vehicles.dll`, so `IsSweepEligible` accepts it.
+- Its `JobOnThing` takes the **`VehiclePawn` itself** as `t`, and the
+  vehicle is present in `cell.GetThingList(map)` - VF's own
+  `MultiSelectClicker` reads `thingGrid.ThingsAt(mousePos)` the same
+  way, so the multi-cell footprint is not a problem.
+- No `HasJobOnThing` override, so the base `JobOnThing(...) != null`
+  applies and our probe is faithful.
+- Its `PotentialWorkThingRequest` is `ThingRequest.ForGroup(Pawn)` - a
+  plain property, so the `req` read in `FindTargetWithJob` cannot throw.
+
+`HelpPackVehicleCaravan` shares the label "pack vehicle" but its worker
+is a bare `WorkGiver`, not a `WorkGiver_Scanner`, so we already reject
+it correctly.
+
+**Root cause 2 - even with the menu reachable, "until done" would haul
+one item with one pawn and stop.** `PackVehicle.PotentialWorkThingsGlobal`
+returns `VehicleReservationManager.VehicleListers(LoadVehicle)` - the
+**vehicles awaiting loading**, not the items to load. So the pool comes
+back holding a single entry, the vehicle itself. Then:
+
+- `BeginAreaSweep` (`SweepManager.cs:344`) breaks out of the pawn loop
+  the moment the pool empties, so only the *first* colonist is ever
+  assigned and the rest of the selection is silently dropped.
+- Each `JobOnThing` yields one `LoadVehicle` job carrying one item. When
+  it ends, `AssignNextTask` finds an empty, non-rescannable pool and
+  calls `RemoveSweep`. One pawn, one item, sweep over - strictly worse
+  than leaving vanilla hauling to it, and nothing like the label.
+
+**This is a general gap, not a vehicle one.** The shared pool assumes
+one job per target. Every "repeatedly bring things to this one thing"
+WorkGiver has the same shape, vanilla included - `WorkGiver_Refuel`,
+`WorkGiver_HaulToContainer`, `FillFermentingBarrel`. The mod already has
+the right machinery for it in `SweepOrder.WorkstationTarget` (re-ask the
+same scanner for the same target until it answers null, see
+`AssignNextTask`), but that path is gated on `scanner is WorkGiver_DoBill`
+and is deliberately single-pawn per section 2.
+
+**Root cause 3 (minor) - duplicate entries.** `PackVehicleTurret`
+(`Vehicles.WorkGiver_RefuelVehicleTurret`, `workType Hauling`) is a
+`WorkGiver_Scanner` that also targets the `VehiclePawn` and also carries
+the label "pack vehicle". A vehicle needing both cargo and turret ammo
+would offer `* Pack vehicle until done` twice. Same class as the Sense
+of Urgency duplicate already open; fold it into that fix rather than
+solving it twice.
+
+**Proposed fix 1 - menu reachability. NOT APPROVED, NOT BUILT.** Harmony
+**prefix** on the `Vehicles.FloatMenuMulti` constructor, signature
+confirmed by reflection as
+`(List<FloatMenuOption>, List<Pawn>, Pawn, string, Vector3)`. A prefix
+runs before the derived constructor's body, hence before the base
+`Verse.FloatMenu` constructor caches option sizes, so mutating the
+incoming list in place is safe and the added entries lay out normally.
+The constructor hands us the selected pawns and the click position -
+exactly the arguments `AddSweepOptions` already takes. Patched by
+reflection (`AccessTools.TypeByName("Vehicles.FloatMenuMulti")`, applied
+only when the type resolves), so Vehicle Framework stays a soft
+dependency and nothing is added to `lib/`. This would be the first
+Harmony patch in the mod aimed at another mod's type.
+
+**Proposed fix 2 - repeat semantics. NOT APPROVED, NOT BUILT.**
+Generalise the `WorkstationTarget` path from "the worker is a
+`WorkGiver_DoBill`" to "this WorkGiver works a persistent target",
+identified by a new `VehicleCompat` helper matching
+`Vehicles.WorkGiver_CarryToVehicle` subclasses by reflected type - which
+covers `PackVehicle` and `LoadUpgradeMaterials` and any future subclass
+without a defName list. Also allow **multiple** pawns on one persistent
+target for this case: VF reserves per *item* inside `FindThingToPack`
+(`pawn.CanReserve(thing)`), so parallel haulers are safe, unlike the
+single-pawn bill case.
+
+Both fixes touch things this document governs - a new Harmony patch, a
+new compat file, and a change to sweep semantics - so per `CLAUDE.md`
+this entry lands first and the code waits on a fresh go-ahead.
 
 **REVIEW SESSION (2026-08-18, evening) - no code changed.** A read-only
 pass over everything the overnight session landed, plus one new in-game

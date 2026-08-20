@@ -1,17 +1,18 @@
-<!-- Pickup context for a fresh session. Updated 2026-08-18 (evening). Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Updated 2026-08-20. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-Resume **this** conversation (code review of the 08-18 changes, radius
-question, standing-still report) with:
+Resume **this** conversation (vehicle-packing investigation, doc commit
+`c19f816`) with:
 
 ```
-claude --resume 5e862c7c-fa2b-40a6-b221-e0174424c01f
+claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9
 ```
 
 Earlier sessions, for reference only:
 
 ```
+OLD: claude --resume 5e862c7c-fa2b-40a6-b221-e0174424c01f   (08-18 review: six findings, radius, standing-still)
 OLD: claude --resume 9fe56f23-dbd5-4515-818c-6170fe4921d1   (fire sweeps / need-pause fix / menu feedback)
 OLD: claude --resume 88fc941c-80ed-4d29-b235-7b39abac91ce   (consume/log triage)
 OLD: claude --resume cc6c6703-86ad-4821-85ea-64813ca0b8ec   (sow fix)
@@ -45,25 +46,63 @@ critical needs (hunger/rest/joy/mood).
 ## State right now - READ THIS FIRST
 
 - Builds clean: `cd DoNotBeLazy/Source/DoNotBeLazy && dotnet build`
-  (0 errors, 0 warnings), re-verified this session.
-- Working tree clean, everything pushed. Check `git log` rather than
-  trusting this line - a previous version of this file was stale about
-  commit state and it cost time.
-- **The 2026-08-18 evening session changed NO code.** It was a review
-  pass plus doc updates. Last code commit is still `9dc8717`.
+  (0 errors, 0 warnings).
+- Working tree clean as of the last commit, `c19f816` (doc-only). Check
+  `git log` rather than trusting this line - this file has been stale
+  about commit state twice now and it cost time both times.
+- **Last code commit is still `9dc8717`.** Neither the 2026-08-18
+  evening review session nor the 2026-08-19/20 vehicle investigation
+  changed any code. `c19f816` was the docs for both.
 - **Test state for the 2026-08-18 code is UNCONFIRMED.** The overnight
   session ended without the DLL being copied into the RimWorld `Mods/`
-  folder. The user played tonight and reported no real bugs, but nobody
-  established whether that session was running the 08-18 build. **Ask
-  before treating fire sweeps, the need-pause fix, or the menu feedback
-  as verified.**
+  folder, and nobody established whether the sessions played since were
+  running the 08-18 build. **Ask before treating fire sweeps, the
+  need-pause fix, or the menu feedback as verified.**
 - Still untested from before: **the sow fixes** (`cc502c9`). Phase 1 of
   the playtest plan has still not been run.
 - **What IS verified in game (2026-08-17):** verbose logging works, and
   a `HaulMerge` sweep runs end to end. Still the only confirmed working
   sweep from a real save.
 
-## Top item for next session: colonists standing still
+## Open item 1: vehicle packing offers no `* pack until done`
+
+Reported 2026-08-19. **Fully diagnosed, nothing implemented, both fixes
+awaiting a go-ahead.** Full detail in architecture doc section 0; the
+short version:
+
+1. **Vehicle Framework eats the whole right-click when 2+ pawns are
+   selected.** It prefixes `Selector.HandleMapClicks`
+   (`Extra.MultiSelectFloatMenu`); on a multi-select right-click over a
+   cell holding a `VehiclePawn` it opens its own one-entry
+   ("Board \<vehicle\>") `FloatMenuMulti` and returns `false`, so vanilla
+   `HandleMapClicks` never runs and `ChoicesAtForMultiSelect` is never
+   called. **Our postfix never fires - so *every* `*` option vanishes on
+   a group click on a vehicle, not just pack.** Single-select is not
+   intercepted and should already work.
+2. **Even with the menu fixed, the sweep would do one item with one
+   pawn.** `PackVehicle.PotentialWorkThingsGlobal` returns the
+   *vehicles* awaiting loading, not the items, so the pool holds one
+   entry; `BeginAreaSweep` drops every pawn after the first, and one
+   `LoadVehicle` job later `AssignNextTask` finds an empty pool and ends
+   the sweep. General gap - the pool assumes one job per target, which
+   is wrong for `WorkGiver_Refuel` / `HaulToContainer` /
+   `FillFermentingBarrel` in vanilla too.
+
+**Do this first, before writing any code: the single-pawn test.** Select
+**one** colonist, right-click a vehicle that is being packed. The option
+should appear. If it does, cause 1 is confirmed and the diagnosis is
+complete. **If it does not appear for a single pawn either, cause 1 is
+not the whole story - keep digging.**
+
+Already established, don't re-derive: `PackVehicle` passes
+`IsSweepEligible` cleanly (workType Hauling, `directOrderable` defaults
+true, worker is a `WorkGiver_Scanner`); its `JobOnThing` targets the
+`VehiclePawn` itself; the vehicle *is* in `cell.GetThingList` despite
+the multi-cell footprint; there is no `HasJobOnThing` override so our
+probe is faithful; and `PotentialWorkThingRequest` is a plain property
+that cannot throw.
+
+## Open item 2: colonists standing still
 
 Reported from play, 2026-08-18: **"workers are back to standing still
 when hunt is not assigned."** Not diagnosed - no repro, no log pulled,
@@ -111,7 +150,10 @@ architecture doc section 0.
    so a refusal there leaves zero entries and zero explanation.
 3. **Duplicate fire entries under Sense of Urgency** -
    `IsFirefighting` keys on `workType.defName`, so that mod's parallel
-   urgent def matches too.
+   urgent def matches too. **Same class as the vehicle duplicate:**
+   `PackVehicleTurret` also carries the label "pack vehicle" and also
+   targets the `VehiclePawn`, so a vehicle needing cargo *and* turret
+   ammo would show `* Pack vehicle until done` twice. Fix both here.
 4. **Paused sweeps now survive interrupts that used to end them** -
    `SweepManager.cs:365`. A manual player order during a pause no longer
    ends the sweep; the pawn is pulled back when it finishes. Looks
@@ -123,12 +165,13 @@ architecture doc section 0.
 6. **Minor fire-rescan effects** - a rescan can re-admit a fire another
    pawn is walking to; `BeginAreaSweep` (`SweepManager.cs:344`) breaks
    out of the pawn loop on an empty pool, so extra pawns never join a
-   rescannable sweep.
+   rescannable sweep. **That same `break` is half of vehicle-packing
+   cause 2** - fixing one should fix the other.
 
 1 and 2 are the two worth fixing before the playtest - both sit inside
 the change that was specifically about not leaving the player guessing.
 
-## Verified this session (don't re-derive)
+## Verified in earlier sessions (don't re-derive)
 
 - **`FireCompat.HasFireJob` is a faithful port** of
   `WorkGiver_FightFires.HasJobOnThing` minus the intended home-area
@@ -174,7 +217,8 @@ https://claude.ai/code/artifact/e60cfd11-1f82-46a8-9111-a25d9352a2dd
 Phase 0 (prove the DLL is current, the logger is live, and the
 `wantedPlantDef` reflection resolved) passes as of 2026-08-17. **Phase 1
 - the four sow tests - has still not been run.** The plan predates the
-fire-sweep and menu-feedback work, so it has no tests for either.
+fire-sweep and menu-feedback work, so it has no tests for either, and
+nothing for vehicles.
 
 One correction to that plan: T3.5 says food yields `* Eat meal`. Wrong.
 Only drugs set `ingestCommandString` in Core, so food and corpses fall
@@ -188,12 +232,12 @@ option-building path in `FloatMenuPatch` contain **zero**
 `Logger.Message` calls - only `Error`/`Warning`. Only `SweepManager` and
 `TaskScanner` are traced, and those only run *after* an option is
 picked. So any "wrong/missing/duplicate menu option" bug is invisible to
-the trace.
+the trace - the vehicle report is the second one in a row that a single
+verbose line per offered option would have answered in minutes.
 
 Partly mitigated by the disabled feedback entries, which surface refusal
 reasons in the menu itself - but only for target-side refusals (see
-finding 1 above). Still worth a verbose line per offered option next
-time this class of bug comes up.
+finding 1 above).
 
 ## Corpse / `* Consume` - investigated, decision is LEAVE AS-IS
 
@@ -261,14 +305,25 @@ direct evidence.
 **~60 mods**, RimWorld 1.5.4409, no DLC. Authoritative list comes from
 the `Loading game from file ... with mods:` block in any log.
 
-On our code paths: **Performance Fish** patches
-`WorkGiverDef::get_Worker()` (which `EligibleDefs()` calls on every def),
-`ListerThings.ThingsMatching`, `WorkGiver_Haul.PotentialWorkThingsGlobal`.
-**TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`.
-**Sense of Urgency** adds parallel "urgent" WorkGiverDefs - a likely
-source of duplicate `*` options, and worth disabling when testing.
-**Reclaim, Reuse, Recycle** adds the harvesting/refurbishment tables
-(both `WorkGiver_DoBill`, so both are sweep-eligible).
+On our code paths:
+
+- **Performance Fish** patches `WorkGiverDef::get_Worker()` (which
+  `EligibleDefs()` calls on every def), `ListerThings.ThingsMatching`,
+  `WorkGiver_Haul.PotentialWorkThingsGlobal`.
+- **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`.
+- **Sense of Urgency** adds parallel "urgent" WorkGiverDefs - a likely
+  source of duplicate `*` options, and worth disabling when testing.
+- **Reclaim, Reuse, Recycle** adds the harvesting/refurbishment tables
+  (both `WorkGiver_DoBill`, so both are sweep-eligible).
+- **Vehicle Framework** (Workshop `3014915404`) prefixes
+  `Selector.HandleMapClicks` and **suppresses vanilla's entire
+  multi-select float menu over a vehicle** - see open item 1. It also
+  adds nine WorkGiverDefs, of which the Hauling ones (`PackVehicle`,
+  `PackVehicleTurret`, `RefuelVehicle`, `LoadUpgradeMaterials`) all
+  target the `VehiclePawn` itself and all want repeat-on-the-same-target
+  semantics we don't have. **Vanilla Vehicles Expanded** (`3014906877`)
+  sits on top of it and adds a garage bench (`WorkGiver_DoBill`, so
+  sweep-eligible) plus `VVE_RestoreWreck`.
 
 ## Two broken third-party mods - ignore their log noise
 
@@ -284,6 +339,12 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
 
 ## Still-open bugs in our code (not yet fixed)
 
+- **The shared pool assumes one job per target.** Correct for
+  haul/mine/cut/sow, wrong for every "keep bringing things to this one
+  thing" WorkGiver - vehicle packing, and `WorkGiver_Refuel` /
+  `HaulToContainer` / `FillFermentingBarrel` in vanilla. The
+  `WorkstationTarget` path already does the right thing but is gated on
+  `scanner is WorkGiver_DoBill` and is single-pawn by design.
 - `ScanCells` has no `IsForbidden` check (`ScanThings` has one).
   Harmless for sow only because `GrowerSow.JobOnCell` checks it
   downstream - latent for any future cell-based WorkGiver.
@@ -314,9 +375,21 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
 
 ## Planned but NOT implemented - do not build without a fresh go-ahead
 
+- **Vehicle fix 1** - Harmony prefix on the `Vehicles.FloatMenuMulti`
+  constructor `(List<FloatMenuOption>, List<Pawn>, Pawn, string,
+  Vector3)`, injecting our options into VF's group menu. The prefix runs
+  before the base `Verse.FloatMenu` constructor caches option sizes, so
+  mutating the list in place is safe. Patched by reflection
+  (`AccessTools.TypeByName`) so VF stays a soft dependency. Would be the
+  first patch in this mod aimed at another mod's type.
+- **Vehicle fix 2** - generalise `WorkstationTarget` to "persistent
+  target" (identified via a new `VehicleCompat` matching
+  `Vehicles.WorkGiver_CarryToVehicle` subclasses by reflected type), and
+  allow multiple pawns on one such target. VF reserves per *item* inside
+  `FindThingToPack`, so parallel haulers are safe.
 - `DoNotBeLazy_Architecture.md` section 5.4 - idle-pawn nudge
-  ("standing" rule). See the standing-still section above for why this
-  is not the fix for tonight's report.
+  ("standing" rule). See open item 2 for why this is not the fix for the
+  standing-still report.
 - The sweep radius overlay - `showSweepOverlay` exists as a setting with
   no code behind it.
 - `DoNotFreakOut_Architecture.md` - a separate, Harmony-free mod. Not
@@ -333,16 +406,39 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
   PowerShell + `[System.Reflection.Assembly]::LoadFrom`. `GetType()`
   returns null for a wrong namespace rather than throwing - and
   `GetTypes()` throws `ReflectionTypeLoadException` on this assembly, so
-  catch it and read `$_.Exception.Types` to enumerate. Caught this way:
-  `IngestibleProperties`/`ThingDefGenerator_Corpses` are in `RimWorld`
+  catch it and read the Types list. Caught this way:
+  `IngestibleProperties` / `ThingDefGenerator_Corpses` are in `RimWorld`
   not `Verse`; `ReservationManager` is in `Verse.AI` not `RimWorld`.
+- **Reflecting on a *mod* DLL needs two extra tricks**, learned on
+  `Vehicles.dll`:
+  - Preload every referenced assembly first
+    (`$asm.GetReferencedAssemblies()` lists them) from
+    `RimWorldWin64_Data\Managed\` and the mod's own `Assemblies\`
+    folder. An `AssemblyResolve` handler that calls `LoadFrom` inside
+    itself recurses into a **StackOverflowException** that kills the
+    PowerShell process outright - preload instead, or have the handler
+    return only already-loaded assemblies.
+  - PowerShell wraps the failure in a `MethodInvocationException`, so
+    `$_.Exception.Types` is **null** - walk `.InnerException` down to
+    the real `ReflectionTypeLoadException` first. Types whose base class
+    failed to load are simply absent from the list, which looks exactly
+    like "that type doesn't exist" - check `LoaderExceptions` before
+    concluding anything.
+- **Mod source beats decompiling the mod.** Vehicle Framework is on
+  GitHub with per-version branches - `release/1.5` matches the shipped
+  1.5 DLL, while `develop` is 1.6 and has already refactored classes we
+  care about (`WorkGiver_CarryToVehicle` became generic there). Use
+  `https://api.github.com/repos/<owner>/<repo>/git/trees/<branch>?recursive=1`
+  to find file paths, then `raw.githubusercontent.com` for the source.
+  Same rule as the RimWorld decompile: **check the branch matches the
+  DLL you are actually running.**
 - **The github decompile is an OLDER BUILD than our DLL - always
   cross-check signatures by reflection before compiling against them.**
   The decompile has `pawn.story.WorkTagIsDisabled(...)`, but in 1.5 it's
   `pawn.WorkTagIsDisabled(...)` on `Pawn` itself. Same for
   `FirstRespectedReserver`, 3-arg here and 2-arg there. **Bodies and
   control flow are still trustworthy** - that's what confirmed
-  `FireCompat` this session.
+  `FireCompat`.
 - `curl -s https://raw.githubusercontent.com/josh-m/RW-Decompile/master/RimWorld/<Class>.cs`
   returns the full verbatim source and is better than a summarizing
   fetch when you need to diff logic line by line. `Verse.AI` classes sit
@@ -354,18 +450,27 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
 - **Grep the Workshop folder for label text** to identify which mod owns
   an unexpected menu entry - `<label>[^<]*harvest[^<]*</label>` across
   `E:\SteamLibrary\steamapps\workshop\content\294100` found the
-  harvesting table in seconds.
+  harvesting table in seconds. To map folder ids to mod names, read each
+  `<id>/About/About.xml` and pull its `<name>` tag.
 - **Grep Core Defs XML** at
   `E:\SteamLibrary\steamapps\common\RimWorld\Data\Core\Defs\` - note
   `WorkGiverDefs\` is a single `WorkGivers.xml`. This is where
-  `directOrderable`/`canBeDoneWhileDrafted` on `FightFires` came from,
+  `directOrderable` / `canBeDoneWhileDrafted` on `FightFires` came from,
   and where the absent `scanThings` (hence default true) was confirmed.
 - **Generalized lesson, now three times burned:** vanilla WorkGivers put
-  real preconditions in `Potential*Global`/`ExtraRequirements`, not in
+  real preconditions in `Potential*Global` / `ExtraRequirements`, not in
   `JobOn*`. This mod calls `JobOn*` directly and silently bypasses all
   of them. Firefighting is the third instance and the first where the
   bypass was what we *wanted* - but it still had to be done by hand, in
   `FireCompat`, rather than falling out for free.
+- **New generalized lesson from the vehicle report: when an option is
+  missing, check whether our patch even ran before theorising about the
+  WorkGiver.** A day's worth of plausible WorkGiver explanations was
+  available and every one of them was wrong - another mod had suppressed
+  the method we postfix. `Selector.HandleMapClicks` and
+  `FloatMenuMakerMap.TryMakeFloatMenu` both sit upstream of our two
+  entry points, and either can be prefixed away by anything in the
+  modlist.
 
 ## Workflow notes
 
@@ -378,6 +483,6 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
 - Commit message style: detailed body explaining *why*. **Only commit
   when explicitly asked.**
 - The model plan in architecture doc section 5 assigns Opus to
-  `FloatMenuPatch`/`SweepManager` work and Sonnet to the test checklist.
-  Reactive playtest bug-fixing was never given a model assignment -
-  don't claim it was.
+  `FloatMenuPatch` / `SweepManager` work and Sonnet to the test
+  checklist. Reactive playtest bug-fixing was never given a model
+  assignment - don't claim it was.
