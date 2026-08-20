@@ -1,4 +1,4 @@
-<!-- Updated: 2026-08-18 EDT - fire sweeps, need-pause loop fixed, no-target feedback -->
+<!-- Updated: 2026-08-18 EDT (evening) - review session, no code changes; FireCompat verified against the decompile, six open review findings, new standing-still report -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
@@ -9,6 +9,177 @@ been run over the Phase 3 files, and the project builds clean (`dotnet
 build` in `DoNotBeLazy/Source/DoNotBeLazy`, 0 errors/0 warnings). The
 mod is now being tested in an actual running game (not just statically
 verified) - see below for what's come out of that so far.
+
+**REVIEW SESSION (2026-08-18, evening) - no code changed.** A read-only
+pass over everything the overnight session landed, plus one new in-game
+report. `git status` clean, `dotnet build` still 0 errors / 0 warnings.
+Nothing in this entry is a code change; it is what the review
+established and what it turned up.
+
+**Verified against the real decompile, not just re-read: `FireCompat.HasFireJob`
+is a faithful port of `WorkGiver_FightFires.HasJobOnThing` minus the
+intended gate.** Fetched `RimWorld/WorkGiver_FightFires.cs` and
+`RimWorld/JobDriver_BeatFire.cs` from the decompile and diffed by hand:
+
+- The faction test in vanilla's pawn-attached branch is
+  `(pawn2.Faction == pawn.Faction || pawn2.HostFaction == pawn.Faction
+  || pawn2.HostFaction == pawn.HostFaction) && !Home[fire.Position] &&
+  ManhattanDistanceFlat(...) > 15`. The faction clause exists **only as
+  part of the home-area gate** - it is not a separate "don't help
+  hostiles" rule, and vanilla does let colonists beat out fires on
+  enemies. So dropping the whole clause along with the home gate is
+  correct, not an accidental omission. Recorded because it reads like an
+  omission on a cold read and would otherwise get "fixed" by someone
+  later.
+- `HandledDistSquared = 25f` with `<=` is exactly vanilla's
+  `InHorDistOf(f.Position, 5f)`. `ReserveCheckDistSquared = 225f` with
+  `>` matches. `JobOnThing` really is a bare
+  `return new Job(JobDefOf.BeatFire, t)` - confirmed, so bypassing
+  `HasJobOnThing` is a complete override with nothing left behind it.
+- `JobDriver_BeatFire.TryMakePreToilReservations` returns `true` without
+  reserving anything; the reservation happens opportunistically in the
+  approach toil (`if (CanReserve(...)) pawn.Reserve(...)`) and the job
+  proceeds either way. Two consequences: `FireIsBeingHandled` does have
+  real reservations to read, so the fan-out mechanism works as intended;
+  and vanilla tolerates two pawns on one fire where our pool-based
+  hand-out does not. Ours is the stricter, wanted behaviour.
+- `FightFires` sets no `scanThings` in `WorkGivers.xml`, so it takes the
+  `WorkGiverDef` default of `true` - the `scanThings` branch does run
+  for it (`scanCells` defaults false).
+
+**Question answered: does a sweep actually find work of the chosen type
+within the radius of the click?** Yes, structurally - and the two ways
+it can quietly find less are both already-known issues, now with a
+concrete consequence attached:
+
+- Radius is honoured in both branches. `BeginAreaSweep` reads
+  `Settings.sweepRadius` (default 16) and passes the clicked cell as
+  centre; `ScanCells` walks `GenRadial.RadialCellsAround` and re-checks
+  `LengthHorizontalSquared > radiusSquared`; `ScanThings` pulls the
+  map-wide lister and drops anything past the same distance. Type is
+  honoured because the same `WorkGiverDef` builds the pool and issues
+  every job drawn from it.
+- **It is a snapshot, not a standing order.** The pool is built once at
+  `BeginSweep`, and only fire sweeps rescan. Work that becomes available
+  inside the radius *after* the click - a plant matures, haulables get
+  dropped, a frame finally has its resources - is never picked up.
+  "Until done" means "until the list from the moment you clicked is
+  done". By design, but stated nowhere a player would see it.
+- **The whole scan runs against one pawn.** `BeginAreaSweep` takes
+  `eligiblePawns[0]` as the driver, and the comment there asserts the
+  filters it applies "don't vary by which pawn asked". That is wrong for
+  three of them: allowed-area, `CanReach`, and `CanReserve` are all
+  per-pawn. A driver who is area-restricted or walled off from part of
+  the radius shrinks the pool for the entire group. Correct the comment
+  when this area is next touched.
+- The scan-time `CanReserve` omits `ignoreOtherReservations` while the
+  `HasJobOn*` probe immediately after passes `forced: true`. So a target
+  another colonist merely has reserved is dropped at scan time even
+  though the forced job would have taken it. Already on the open list;
+  this is the most likely reason for a pool that comes back smaller than
+  the player can see work for.
+
+**Confirmed by grep, not newly discovered: `showSweepOverlay` still does
+nothing.** Section 3.4 already records that the setting exists and
+nothing reads it; a full-tree grep tonight confirms that is still true -
+the field is declared, scribed, and given a checkbox reading "Show sweep
+radius overlay on hover", and no code anywhere reads it. Worth
+re-flagging here rather than only in 3.4 because it interacts with the
+radius question above: a player asking "is it really sweeping 16 tiles"
+has no way to see the answer, and the checkbox actively implies they
+should. Either build the overlay or drop the checkbox; a control that
+does nothing is worse than neither. Untouched tonight because no code
+was changed.
+
+**Review findings, open and unfixed.** Ordered by how much they matter,
+all of them in the overnight session's own new code:
+
+1. **The new menu feedback doesn't cover pawn-side refusals**
+   (`FloatMenuPatch.cs:204`). When `EligiblePawns` comes back empty the
+   def is skipped with `continue` **before** any feedback is built - so
+   "Hauling is priority 0 in the work tab", "the pawn is drafted", "no
+   Manipulation" all still produce the old silent nothing. Given
+   `PawnValidator.CanSweep` requires `WorkIsActive`, this is at least as
+   likely an answer to the standing *cannot force-haul stone blocks*
+   report as `NoEmptyPlaceLower` is. Fix is a disabled entry for this
+   case, scoped by `req.Accepts(thing)` the same way so it cannot spam
+   every def in the game.
+2. **A burning cell can now produce a completely empty menu**
+   (`FloatMenuPatch.cs:198`). Fire suppresses every other def and
+   `* Consume`, but `FireCompat.HasFireJob` never writes to
+   `JobFailReason`, so if it refuses (unreachable, already handled) or
+   no selected pawn is fire-eligible, the player gets zero entries and
+   zero explanation. Needs a hardcoded reason string on the firefighting
+   path - there is no vanilla one to inherit, since vanilla never offers
+   this option at all.
+3. **Duplicate fire entries under Sense of Urgency.**
+   `FireCompat.IsFirefighting` keys on `workType.defName`, so that mod's
+   parallel urgent firefighting def matches too and a burning cell would
+   offer `* fight fires until done` twice. Same duplicate class already
+   suspected elsewhere in the menu; fire inherits it.
+4. **Paused sweeps now survive interrupts that used to end them**
+   (`SweepManager.cs:365`). The paused branch returns before the
+   `TargetFailureIsRecoverable` check, so while paused, a manual player
+   work order is no longer "something took this pawn" - when that job
+   ends and needs are satisfied, the sweep yanks them back. Drafting is
+   still caught by `MapComponentTick`. This looks intentional given the
+   "resume last-ordered work" requirement, but it is a behaviour change
+   beyond the reported bug and will show up in testing.
+5. **`MaxPauseTicks` is only evaluated on a job end**
+   (`SweepManager.cs:381`). A pawn who sleeps 20,000 ticks in one job
+   holds the pool until they wake. Harmless, but the log line prints the
+   constant rather than the elapsed time, so it claims "after 30000
+   ticks paused" when it may have been far longer. One-line fix.
+6. **Two minor fire-rescan effects.** A rescan re-admits a fire another
+   pawn is walking to (more than 5 tiles out, not yet reserved), so two
+   pawns can converge - self-correcting, not worth code.
+   `BeginAreaSweep` also breaks out of the pawn-assignment loop the
+   moment the pool is empty (`SweepManager.cs:344`), so extra pawns
+   never join a rescannable sweep that a rescan would have found work
+   for.
+
+None of the six is a crash or compile risk. 1 and 2 are the two worth
+fixing before the playtest, since both sit inside the change that was
+specifically about not leaving the player guessing.
+
+**NEW REPORT (2026-08-18, from play): colonists stand still when hunting
+is not assigned.** Reported verbatim as "workers are back to standing
+still when hunt is not assigned", and **"back to"** is the important
+word - a returning symptom, not a first sighting. Not diagnosed: no
+repro, no log pulled, no code changed. Deferred to next session as the
+first item. What is already known that bears on it, in the order worth
+checking:
+
+- **Sense of Urgency** (`ZombiePhil.Urgency`, Workshop 3001253573) is
+  compiled against 1.6 and throws on `Toils_General.WaitWith` in 1.5.
+  Hunting is the specific thing it breaks - already documented here as
+  hunters looping "started 10 jobs in 10 ticks" forever. A WorkGiver
+  that throws during `TryFindAndStartJob` can plausibly leave a pawn
+  with no job at all, which looks exactly like standing still. **Test
+  with that mod disabled before anything else.**
+- **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`
+  directly - the same method any "pawn will not pick up work" symptom
+  runs through.
+- **Ours, and cheap to rule in or out:** `JobTrackerPatch.Postfix` runs
+  on every `EndCurrentJob` for every pawn. It early-returns unless the
+  pawn is in an active sweep, so the blast radius is small - but the
+  `scanner.JobOnThing(pawn, billGiver, true)` bill-continuation call is
+  **not** wrapped in a try/catch, so a throwing modded WorkGiver would
+  propagate out of `EndCurrentJob` and could leave that pawn jobless.
+  Affects only pawns in a sweep. A run with Do Not Be Lazy disabled
+  entirely is the one test that separates our bug from the modlist's.
+- **Section 5.4's idle-pawn nudge is precisely the countermeasure for
+  this symptom and is still unbuilt.** Do not build it as a fix before
+  the cause is known: nudging an idle pawn whose think tree is throwing
+  just re-throws on a two-second timer.
+
+**Test state is UNCONFIRMED for everything from 2026-08-18.** The
+overnight session ended with the DLL not yet copied into the RimWorld
+`Mods/` folder. The user played tonight and reported no real bugs, but
+whether that session was running the 2026-08-18 build was never
+established. **Ask before treating any 2026-08-18 change as verified in
+game.** The only sweep confirmed working from a real save remains the
+`HaulMerge` run from 2026-08-17.
 
 **NEW (2026-08-18): `* Fight fires until done` - group firefighting, with
 vanilla's home-area restriction deliberately overridden.** Reported as
@@ -887,6 +1058,15 @@ this in a real save is still worth doing**, per Phase 4 below.
 
 Architected 2026-08-15 per explicit request. **Not built yet** - this
 section is planning only, no code exists for it.
+
+**Relevant to the 2026-08-18 standing-still report (see section 0):**
+this feature is the direct countermeasure for "colonists stand around
+doing nothing", so it is going to look like the obvious fix. It is not,
+until the cause is known. If pawns are idle because a modded WorkGiver
+throws inside `TryFindAndStartJob`, ending their wait job just re-runs
+the same throwing think tree every two seconds - the nudge would hide a
+diagnosable bug behind a busy-looking colony. Diagnose first, then
+decide whether this is still worth building.
 
 **Intent:** a periodic, low-frequency check that catches colonists who
 are standing idle (no job, or parked in a wander/wait job) despite
