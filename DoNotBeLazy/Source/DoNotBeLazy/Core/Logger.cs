@@ -13,11 +13,26 @@ namespace DoNotBeLazy.Core
     {
         public static bool VerboseLogging = false;
 
+        // Separate switch from VerboseLogging on purpose - job-pipeline
+        // diagnostics and the sweep trace answer different questions and
+        // you rarely want both walls of text at once.
+        public static bool JobDiagnostics = false;
+
         private const string Prefix = "[DoNotBeLazy] ";
 
         public static void Message(string text)
         {
             if (VerboseLogging)
+            {
+                Verse.Log.Message(Prefix + text);
+            }
+        }
+
+        // same prefix as everything else so one extraction still catches
+        // the lot - the pull-logs command splits them apart afterwards
+        public static void Diag(string text)
+        {
+            if (JobDiagnostics)
             {
                 Verse.Log.Message(Prefix + text);
             }

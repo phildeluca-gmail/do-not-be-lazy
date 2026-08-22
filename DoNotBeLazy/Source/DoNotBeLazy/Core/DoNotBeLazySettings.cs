@@ -12,6 +12,7 @@ namespace DoNotBeLazy.Core
         public float moodThreshold = 0.10f;
         public bool showSweepOverlay = true;
         public bool verboseLogging = false;
+        public bool jobDiagnostics = false;
 
         public override void ExposeData()
         {
@@ -21,11 +22,13 @@ namespace DoNotBeLazy.Core
             Scribe_Values.Look(ref moodThreshold, "moodThreshold", 0.10f);
             Scribe_Values.Look(ref showSweepOverlay, "showSweepOverlay", true);
             Scribe_Values.Look(ref verboseLogging, "verboseLogging", false);
+            Scribe_Values.Look(ref jobDiagnostics, "jobDiagnostics", false);
 
             // the toggle only exists to drive this - keep them in sync on
             // load as well as on change, or a saved "on" reads as off until
             // the settings window is opened
             Logger.VerboseLogging = verboseLogging;
+            Logger.JobDiagnostics = jobDiagnostics;
         }
 
         public void DoWindowContents(Rect inRect)
@@ -51,6 +54,20 @@ namespace DoNotBeLazy.Core
             listing.CheckboxLabeled("Verbose logging (for bug reports)", ref verboseLogging,
                 "Writes a [DoNotBeLazy] trace of every sweep decision to the log. Leave off for normal play.");
             Logger.VerboseLogging = verboseLogging;
+
+            listing.Gap();
+            bool wasDiagnostics = jobDiagnostics;
+            listing.CheckboxLabeled("Job diagnostics (why is this pawn standing still)", ref jobDiagnostics,
+                "Traces idle jobs, who issued them, and which mods have patched the job pipeline. Separate from verbose logging. Leave off for normal play.");
+            Logger.JobDiagnostics = jobDiagnostics;
+
+            // census normally runs at startup, when this was probably off -
+            // re-run it on the way in so you don't have to restart the game
+            // just to see who's patching what
+            if (jobDiagnostics && !wasDiagnostics)
+            {
+                Utility.PipelineCensus.Run();
+            }
 
             listing.End();
         }

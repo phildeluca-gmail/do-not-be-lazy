@@ -1,8 +1,246 @@
-<!-- Updated: 2026-08-20 EDT - vehicle-packing investigation, no code changes; VF hijacks the multi-select right-click, and the shared pool assumes one job per target -->
+<!-- Updated: 2026-08-22 EDT - job diagnostics built (census/idle trace/idle probe) plus a /pull-logs command; the 08-18 build was under test all along -->
 
 # Do Not Be Lazy - RimWorld 1.5 Mod Architecture
 
-## 0. Current Status (2026-08-20)
+## 0. Current Status (2026-08-22)
+
+**ANSWERED (2026-08-22): the 2026-08-18 build HAS been under test since
+2026-08-18.** The installed copy at
+`E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\DoNotBeLazy.dll`
+is dated **2026-08-18 22:07**, so every session played since then ran
+the fire-sweep / need-pause / menu-feedback build. This had been open
+for three sessions and was answerable in one `ls`; it is now step 1 of
+`/pull-logs`. Note the corollary: **today's fixes are not installed** -
+that DLL is still the 08-18 one, and the repo build is newer.
+
+
+**STANDING STILL, 2026-08-21: Sense of Urgency is ruled out by test, and
+the instrumentation to name the real cause is now BUILT** (2026-08-22,
+approved and implemented; untested in game).
+Reported from play: with Sense of Urgency disabled, pawns assigned to
+Hunting still stand still. Combined with the correction above (that mod
+throws nothing and adds nothing sweep-eligible), it is out of the
+picture entirely.
+
+**Read from the decompile before designing anything, and two of these
+change what we thought:**
+
+- `JobGiver_Work.TryIssueJobPackage` **already wraps every WorkGiver call
+  in try/catch** (twice - the scan loop and `GiverTryGiveJobPrioritized`)
+  and logs `Exception in WorkGiver ...` before moving on to the next
+  giver. So "a modded WorkGiver throws and the pawn ends up with no job"
+  is **wrong for the think-tree path** - vanilla absorbs it loudly and
+  continues. The same hypothesis still stands for our own
+  `JobTrackerPatch.Postfix`, which calls `JobOnThing` from inside
+  `EndCurrentJob` with no try/catch of its own and no vanilla one around
+  it.
+- `Pawn_JobTracker.DetermineNextJob` catches think-tree exceptions and
+  routes them to `JobUtility.TryStartErrorRecoverJob`, which logs. So a
+  throwing think tree is loud too.
+- **The genuinely silent paths are the two in `TryFindAndStartJob`:** if
+  `CanDoAnyJob()` is false it clears the queue and returns without a
+  word, and if `DetermineNextJob` comes back `ThinkResult.NoJob` the
+  method simply falls off the end - no job, no log line, nothing. A pawn
+  in that state stands there with `curJob == null` and vanilla never
+  says why. That is the state worth instrumenting, and nothing in the
+  game reports it.
+- Vanilla already has a per-pawn job trace: `Pawn_JobTracker.debugLog`
+  is a public instance bool, and `DebugLogEvent` writes every job start,
+  end and condition for that pawn when it is set.
+- `Job` carries `jobGiver` (the `ThinkNode` that issued it),
+  `jobGiverThinkTree` and `workGiverDef`. The declaring type of
+  `jobGiver` names the mod responsible for any job, including a wander
+  or wait.
+
+**Instrumentation gap that has cost every log so far:** the extraction
+workflow greps `[DoNotBeLazy]` and nothing else, so vanilla's own
+`Exception in WorkGiver X` and `threw exception while determining job`
+lines - the loud half of the above - have never been in any extraction
+we've read. Pulling `Exception|WorkGiver|error recover|no job` from the
+raw log costs nothing and should happen before any code is written.
+
+**Three instruments, all behind the new `jobDiagnostics` setting, off by
+default and separate from verbose logging. Built 2026-08-22:**
+
+1. **Pipeline census, once at startup.** `Harmony.GetPatchInfo` over
+   `Pawn_JobTracker.TryFindAndStartJob`, `StartJob`, `EndCurrentJob` and
+   `JobGiver_Work.TryIssueJobPackage`, logging each patch owner id. Names
+   every mod sitting in this path (TKS Priority Treatment is known to be
+   one) without theorising about which ones might be. No behaviour
+   change at all - it only reads Harmony's own registry.
+2. **Job-source trace.** Postfix on `Pawn_JobTracker.StartJob` logging,
+   for player colonists, the `JobDef`, the declaring type of
+   `job.jobGiver`, and `jobGiverThinkTree.defName`. This splits the
+   report in two: repeated `Wait_MaintainPosture`/`GotoWander` entries
+   mean the think tree is healthy and `JobGiver_Work` is declining
+   hunting, while **no lines at all** for an idle pawn means
+   `DetermineNextJob` returned `NoJob` and the think tree is the
+   problem. Those two need completely different fixes and are
+   indistinguishable by eye in game.
+3. **Idle probe, rate-limited.** A `MapComponentTick` sweep every ~250
+   ticks over player pawns with `curJob == null`, logging pawn, drafted
+   state, mental state, `CanDoAnyJob`-relevant flags, and the Hunting
+   priority. Deliberately does **not** re-run WorkGivers to ask why:
+   calling `ShouldSkip`/`JobOnThing` outside the think tree is the exact
+   static-state trap this mod has been burned by three times, and a
+   diagnostic that changes the behaviour it is measuring is worse than
+   no diagnostic.
+
+None of the three touches sweep behaviour, and 1 and 2 are read-only.
+
+**As built (2026-08-22), with the decisions that were taken:**
+
+- `Utility/PipelineCensus.cs` - runs from a `[StaticConstructorOnStartup]`
+  hook rather than our `Mod` constructor, because mods patch from their
+  own constructors and counting at ours would miss everyone who loads
+  after us. Covers `TryFindAndStartJob`, `StartJob`, `EndCurrentJob`,
+  `DetermineNextJob` and `JobGiver_Work.TryIssueJobPackage`, and prints
+  `METHOD NOT FOUND` rather than silently skipping if a name moves in a
+  future build. Guarded to run once, plus once more if the checkbox is
+  switched on mid-session.
+- `Patches/JobSourcePatch.cs` - postfix on `Pawn_JobTracker.StartJob`,
+  filtered to colonists and to an idle-shaped `JobDef` allowlist (`Wait`,
+  `Wait_MaintainPosture`, `Wait_Wander`, `GotoWander`, `Goto`, `LayDown`
+  and friends). Logs the `JobDef`, the `jobGiver` node's type, **its
+  assembly name**, and the think tree. The assembly is the part that
+  names a mod outright. **No throttle, deliberately** - a pawn cycling
+  the same wait job every few ticks is the report itself, and deduping
+  would hide exactly what's being looked for; the setting is the volume
+  control.
+- `Components/IdleProbe.cs` - `MapComponent`, every 250 ticks, logging
+  free colonists whose `curJob` is null along with drafted/downed/mental
+  state, queue length, Hunting priority and whether a thinker exists.
+  Reads pawn state only; it never re-runs a WorkGiver.
+
+Reading the output: `job` lines looping for a pawn mean the think tree
+is alive and `JobGiver_Work` is declining the work. An `idle` line for a
+pawn with **no** `job` lines means `DetermineNextJob` returned `NoJob`.
+Those are different bugs and this is the only way to tell them apart.
+
+**Also built: a `/pull-logs` command** (`.claude/commands/pull-logs.md`,
+checked into the repo). Extracts the `[DoNotBeLazy]` trace, vanilla's own
+exception lines - which no extraction in this project had ever included -
+and the active mod block, archives all three to a gitignored `logs/`
+with a timestamp, and summarizes. It checks the timestamps of the log,
+the installed DLL and the built DLL **first**, because "which build
+produced this log" has been wrong twice.
+
+**CORRECTION (2026-08-21): Sense of Urgency is not the broken mod, and
+it cannot duplicate our menu options.** Both claims were wrong and both
+were repeated in three documents. Checked against the installed files,
+not re-read:
+
+- The installed copy is `modVersion 1.2`, `About.xml` declares
+  `<li>1.4</li><li>1.5</li>`, and it ships **per-version assemblies** -
+  `1.5/Assemblies/ZombiePhil.Urgency.v15.dll`, dated April 2025, which
+  is what 1.5 loads. A binary grep of that DLL finds **no** occurrence
+  of `WaitWith`, `Toils_General`, `JobDriver` or `Harmony`: it is
+  WorkGivers and defs, with no job drivers and no patches at all.
+- `WaitWith` belongs to **Automatic Hunting**
+  (`3340648302/1.5/Assemblies/ARY_AutomaticHunting.dll`) - the only mod
+  in the installed workshop folder that references it, alongside the
+  `TraverseParms.For` breakage already recorded. So the "hunting is
+  completely broken, hunters loop 10 jobs in 10 ticks" symptom was
+  misattributed: **Automatic Hunting is the hunting mod that throws**,
+  and it is still enabled. That makes it the first thing to disable for
+  the standing-still report, not Urgency.
+- Urgency's WorkGiverDefs are workType `Urgent`, `Doctor`, `Cooking`,
+  `Hunting` and the Complex Jobs `FSF*` types. **None is `Firefighter`**,
+  so `FireCompat.IsFirefighting` cannot match one and review finding 3's
+  duplicate-fire scenario cannot happen. Stronger than that: none of its
+  givers is a `WorkGiver_DoBill` and none carries a workType in
+  `SupportedWorkTypeDefNames`, so **no Urgency def is sweep-eligible at
+  all** - it cannot duplicate any `*` option, and it is not a candidate
+  explanation for the vanished `* forced delivery` entry either. The one
+  real duplicate risk left is `PackVehicleTurret`.
+
+Where the wrong claim came from is worth naming, since the method that
+produced it is still in use elsewhere: a `MissingMethodException` in a
+log was attributed to whichever mod looked most related to the symptom,
+rather than to the assembly that actually references the method. The
+mod that breaks hunting and the mod named "hunting priority" were not
+the same mod.
+
+**T0.3 PASSES (2026-08-21, from play).** Sow sweeps ran with no
+`WorkGiver_Grower.wantedPlantDef not found` warning in the extraction,
+and the trace lines carry `plant=Plant_Rice` - the reflected field
+resolved and is being read. Run against the pre-session build, which is
+the right build for this test: nothing in the 2026-08-21 fix touches
+`GrowerCompat`.
+
+**First in-game evidence that the preparatory re-queue works.** From the
+same extraction:
+
+```
+BeginSweep GrowerSow: 259 targets, 3 pawns
+Belle: Sow on (105, 0, 127) plant=Plant_Rice (258 left)
+Boris: CutPlant on (102, 0, 136) (257 left)
+Joy: Sow on (108, 0, 137) plant=Plant_Rice (257 left)
+```
+
+Two things that look like bugs and are not. `CutPlant` inside a
+`GrowerSow` sweep is `GrowerSow.JobOnCell` answering "clear the blocker
+first", which is exactly what `GrowerCompat.IsPreparatoryJob` exists to
+catch. And 257 appearing twice is that catch working: the count is
+logged at `SweepManager.cs:550`, **before** the re-add at 558, so
+Boris's cell came back into the pool after his line printed (257 -> 258)
+and Joy's assignment took it to 257 again. Three pawns were assigned in
+parallel out of one pool, which is also the first confirmation of the
+multi-pawn path outside `HaulMerge`.
+
+**FIXED (2026-08-21): review findings 1 and 2 - the menu no longer goes
+silent on a pawn-side refusal, and a burning cell always opens a menu.**
+Both were in the 2026-08-18 feedback work; both left the player with a
+right-click that looked broken.
+
+*Finding 1 - pawn-side refusals.* `Build` skipped a def with `continue`
+the moment `EligiblePawns` came back empty, before any feedback existed,
+so "Hauling is priority 0", "the pawn is drafted" and "no Manipulation"
+produced silent nothing. `PawnValidator` now exposes **why** it refused,
+not just that it did: the body of `CanSweep` moved into a private
+`Check` returning a `Refusal` enum, `CanSweep` is `Check(...) ==
+Refusal.None`, and a new `RefusalReason` turns the enum into words. The
+enum rather than a string is deliberate - `SweepManager` calls
+`CanSweep` every tick for every pawn in a sweep, and the menu is the
+only caller that ever needs the text.
+
+The reasons are **hardcoded English wrapped around translated def
+labels** (`workType.gerundLabel`), not vanilla's own keys. Vanilla has
+exactly the right strings - `CannotPrioritizeNotAssignedToWorkType`,
+`CannotPrioritizeWorkTypeDisabled`, `CannotMissingHealthActivities`, all
+confirmed present in 1.5 Core `Keyed/FloatMenu.xml` - but every one of
+them is prefixed "Cannot prioritize:", which inside our label reads
+"* Haul until done - Cannot prioritize: Not assigned to hauling". The
+rest of this mod's UI strings are hardcoded English anyway.
+
+Scoped by a new `WantsSomethingHere`: a def only gets to explain itself
+when its `PotentialWorkThingRequest` accepts something actually on the
+clicked cell - the same rule the target-side entries use, and the reason
+this doesn't turn every click into a wall of grey. Fire is waved through
+that check (see below). Cell-scanned defs are left out, same as
+`FindTargetWithJob` leaves them out: bare ground refusing to be a
+growing zone is not an error worth reporting. Only the **first**
+refusing pawn is named, not a tally - the group usually fails for one
+shared reason, and one representative explains the click.
+
+*Finding 2 - a burning cell could open no menu at all.* Fire suppresses
+every other def and `* Consume`, and `FireCompat.HasFireJob` is ours, so
+it never writes `JobFailReason` - a refusal (unreachable, or another
+pawn already handling it within 5 tiles) contributed zero options and
+zero explanation, vanilla had nothing of its own for a bare burning
+tile, and `TryMakeFloatMenu` returns without showing a window on an
+empty list. `FindTargetWithJob` now sets a hardcoded reason on the
+firefighting path when a `Fire` yields no job, guarded to `thing is
+Fire` so a scorched plant on the same cell can't end up named in the
+entry. Confirmed from the decompile that a **disabled** entry is enough
+to make the window appear: `TryMakeFloatMenu` only bails on
+`list.Count == 0`, and its auto-take shortcut breaks out on the first
+`Disabled` option rather than firing it.
+
+Also in this change: `DisabledOption` now takes the "what" prefix as a
+string rather than a `Thing`, since the pawn-side entries name a pawn.
+
+Not touched: findings 3-6.
 
 Phases 1-3 are implemented, an Opus compatibility/correctness pass has
 been run over the Phase 3 files, and the project builds clean (`dotnet
@@ -91,8 +329,8 @@ and is deliberately single-pawn per section 2.
 `WorkGiver_Scanner` that also targets the `VehiclePawn` and also carries
 the label "pack vehicle". A vehicle needing both cargo and turret ammo
 would offer `* Pack vehicle until done` twice. Same class as the Sense
-of Urgency duplicate already open; fold it into that fix rather than
-solving it twice.
+of Urgency duplicate that was open at the time - since withdrawn, so
+this is now the only case of its kind.
 
 **Proposed fix 1 - menu reachability. NOT APPROVED, NOT BUILT.** Harmony
 **prefix** on the `Vehicles.FloatMenuMulti` constructor, signature
@@ -207,8 +445,9 @@ was changed.
 **Review findings, open and unfixed.** Ordered by how much they matter,
 all of them in the overnight session's own new code:
 
-1. **The new menu feedback doesn't cover pawn-side refusals**
-   (`FloatMenuPatch.cs:204`). When `EligiblePawns` comes back empty the
+1. **FIXED 2026-08-21 - The new menu feedback didn't cover pawn-side
+   refusals** (`FloatMenuPatch.cs:204`). See the entry at the top of this
+   section for what was done. When `EligiblePawns` comes back empty the
    def is skipped with `continue` **before** any feedback is built - so
    "Hauling is priority 0 in the work tab", "the pawn is drafted", "no
    Manipulation" all still produce the old silent nothing. Given
@@ -217,19 +456,28 @@ all of them in the overnight session's own new code:
    report as `NoEmptyPlaceLower` is. Fix is a disabled entry for this
    case, scoped by `req.Accepts(thing)` the same way so it cannot spam
    every def in the game.
-2. **A burning cell can now produce a completely empty menu**
-   (`FloatMenuPatch.cs:198`). Fire suppresses every other def and
-   `* Consume`, but `FireCompat.HasFireJob` never writes to
-   `JobFailReason`, so if it refuses (unreachable, already handled) or
-   no selected pawn is fire-eligible, the player gets zero entries and
-   zero explanation. Needs a hardcoded reason string on the firefighting
-   path - there is no vanilla one to inherit, since vanilla never offers
-   this option at all.
-3. **Duplicate fire entries under Sense of Urgency.**
-   `FireCompat.IsFirefighting` keys on `workType.defName`, so that mod's
-   parallel urgent firefighting def matches too and a burning cell would
-   offer `* fight fires until done` twice. Same duplicate class already
-   suspected elsewhere in the menu; fire inherits it.
+2. **FIXED 2026-08-21 - A burning cell could produce NO MENU AT ALL**
+   (`FloatMenuPatch.cs:198`). See the entry at the top of this section. Corrected from the original wording of
+   this finding, which said "a completely empty menu" - that is not what
+   the player sees, and the difference matters. Fire suppresses every
+   other def and `* Consume`, and `FireCompat.HasFireJob` never writes
+   to `JobFailReason`, so if it refuses (unreachable, already handled
+   within 5 tiles) or no selected pawn is fire-eligible, we contribute
+   zero options and zero explanation. Vanilla has nothing of its own to
+   offer on a bare burning tile either, and
+   `FloatMenuMakerMap.TryMakeFloatMenu` returns without showing a window
+   when the list comes back empty. So the float menu **never opens** -
+   the right-click looks dead, indistinguishable from a misclick or a
+   broken mod. Needs a hardcoded reason string on the firefighting path
+   so there is at least one entry to render; there is no vanilla one to
+   inherit, since vanilla never offers this option at all.
+3. **WITHDRAWN 2026-08-21 - duplicate fire entries under Sense of
+   Urgency.** The premise was false: that mod adds no `Firefighter`
+   WorkGiverDef, and in fact adds nothing sweep-eligible at all. See the
+   correction at the top of this section. `FireCompat.IsFirefighting`
+   still keys on `workType.defName`, which is the right key - it just
+   has no duplicate to catch here. The real duplicate risk is
+   `PackVehicleTurret` sharing the "pack vehicle" label.
 4. **Paused sweeps now survive interrupts that used to end them**
    (`SweepManager.cs:365`). The paused branch returns before the
    `TargetFailureIsRecoverable` check, so while paused, a manual player
@@ -251,9 +499,10 @@ all of them in the overnight session's own new code:
    never join a rescannable sweep that a rescan would have found work
    for.
 
-None of the six is a crash or compile risk. 1 and 2 are the two worth
-fixing before the playtest, since both sit inside the change that was
-specifically about not leaving the player guessing.
+None of the six is a crash or compile risk. 1 and 2 were the two worth
+fixing before the playtest, since both sat inside the change that was
+specifically about not leaving the player guessing - **both are fixed as
+of 2026-08-21 and untested in game.** 3-6 are still open.
 
 **NEW REPORT (2026-08-18, from play): colonists stand still when hunting
 is not assigned.** Reported verbatim as "workers are back to standing
@@ -263,13 +512,16 @@ repro, no log pulled, no code changed. Deferred to next session as the
 first item. What is already known that bears on it, in the order worth
 checking:
 
-- **Sense of Urgency** (`ZombiePhil.Urgency`, Workshop 3001253573) is
-  compiled against 1.6 and throws on `Toils_General.WaitWith` in 1.5.
-  Hunting is the specific thing it breaks - already documented here as
-  hunters looping "started 10 jobs in 10 ticks" forever. A WorkGiver
-  that throws during `TryFindAndStartJob` can plausibly leave a pawn
-  with no job at all, which looks exactly like standing still. **Test
-  with that mod disabled before anything else.**
+- **Automatic Hunting** (`Arylice.Rimworld.AutomaticHunting`, Workshop
+  3340648302) is the mod that throws on `Toils_General.WaitWith`, on top
+  of the `TraverseParms.For` breakage in its `GameComponentTick`.
+  Corrected 2026-08-21 - this was attributed to Sense of Urgency for
+  three sessions and it was never true of it. A WorkGiver or job driver
+  that throws during `TryFindAndStartJob` can leave a pawn with no job
+  at all, which looks exactly like standing still. **Test with Automatic
+  Hunting disabled before anything else** - and note that disabling
+  Sense of Urgency, which has been the standing advice, would not have
+  changed a thing.
 - **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`
   directly - the same method any "pawn will not pick up work" symptom
   runs through.
@@ -970,9 +1222,12 @@ DoNotBeLazy/
         DoNotBeLazySettings.cs     # ModSettings (radius, threshold)
       Patches/
         FloatMenuPatch.cs          # Postfix on GetOptions
+        JobTrackerPatch.cs         # Postfix on EndCurrentJob - chains sweeps
+        JobSourcePatch.cs          # DIAGNOSTIC - postfix on StartJob, idle jobs
       Components/
         SweepManager.cs            # MapComponent - tracks active sweeps
         NeedMonitor.cs             # GameComponent - tick-level need checks
+        IdleProbe.cs               # DIAGNOSTIC - MapComponent, finds jobless pawns
       Jobs/
         JobDriver_AreaSweep.cs     # Custom JobDriver
         JobDef_Registration.cs     # Programmatic JobDef
@@ -981,6 +1236,7 @@ DoNotBeLazy/
         PawnValidator.cs           # Permission/capability checks
         GrowerCompat.cs            # WorkGiver_Grower static-state + sow gates
         FireCompat.cs              # FightFires detection, home-area override
+        PipelineCensus.cs          # DIAGNOSTIC - who else patched the job pipeline
 ```
 
 ### 3.2 Component Descriptions
@@ -1068,6 +1324,8 @@ drop. Three responsibilities:
 - `sweepRadius` - int, default 16, configurable 1-50
 - `needThreshold` - float, default 0.05 (5%), configurable 0.01-0.20 - covers hunger/recreation/rest
 - `moodThreshold` - float, default 0.10 (10%), configurable 0.01-0.30 - separate slider, mood specifically (added 2026-08-15 per user request; mood dropping to 5% is already close to a mental break, so it gets its own, higher default)
+- `verboseLogging` - bool, default false - the `[DoNotBeLazy]` sweep trace. Hardcoded false until 2026-08-16, which made every `Logger.Message` a no-op; see section 0.
+- `jobDiagnostics` - bool, default false (added 2026-08-21) - the standing-still instruments: pipeline census, idle-job trace, idle probe. Deliberately **separate** from `verboseLogging` - the two answer different questions and nobody wants both walls of text at once. Switching it on in the settings window re-runs the census immediately, so a diagnosis doesn't need a game restart.
 - `showSweepOverlay` - bool, default true (highlight radius on hover) - **setting exists but nothing reads it yet**; no overlay-drawing code has been written. Not in the Phase 1-3 plan as a separate task, so it fell out of scope. Needs a task added (likely a `MapComponent.MapComponentOnGUI()` or `MapComponent.MapComponentUpdate()` override) before this setting does anything.
 
 ## 4. Edge Cases and Risks

@@ -203,6 +203,18 @@ namespace DoNotBeLazy.Patches
                 List<Pawn> eligiblePawns = EligiblePawns(pawns, map, def);
                 if (eligiblePawns.Count == 0)
                 {
+                    // used to just continue here, which is how "Hauling is
+                    // priority 0" and "the pawn is drafted" came out as
+                    // silent nothing - the whole point of the greyed-out
+                    // entries was to stop that
+                    if (feedback.Count < MaxFeedbackOptions && WantsSomethingHere(def, thingsHere, fireHere))
+                    {
+                        string why = FirstRefusal(pawns, map, def, out Pawn refused);
+                        if (why != null)
+                        {
+                            feedback.Add(DisabledOption(def, refused.LabelShort, why));
+                        }
+                    }
                     continue;
                 }
 
@@ -212,7 +224,7 @@ namespace DoNotBeLazy.Patches
                 {
                     if (failReason != null && feedback.Count < MaxFeedbackOptions)
                     {
-                        feedback.Add(DisabledOption(def, failThing, failReason));
+                        feedback.Add(DisabledOption(def, failThing?.LabelShort, failReason));
                     }
                     continue;
                 }
@@ -256,10 +268,12 @@ namespace DoNotBeLazy.Patches
         //
         // Reason text comes from JobFailReason, so it's the game's own
         // wording, already translated.
-        private static FloatMenuOption DisabledOption(WorkGiverDef def, Thing thing, string reason)
+        private static FloatMenuOption DisabledOption(WorkGiverDef def, string subject, string reason)
         {
             string label = def.label.NullOrEmpty() ? def.defName : def.label.CapitalizeFirst();
-            string what = thing != null ? thing.LabelShort + ": " : "";
+            // subject is the thing that refused for target-side entries and
+            // the pawn that refused for pawn-side ones
+            string what = subject.NullOrEmpty() ? "" : subject + ": ";
 
             return new FloatMenuOption(
                 "* " + label + " until done - " + what + reason,
@@ -533,6 +547,19 @@ namespace DoNotBeLazy.Patches
                                 failReason = JobFailReason.Reason;
                                 failThing = thing;
                             }
+                            else if (failReason == null && firefighting && thing is Fire)
+                            {
+                                // HasFireJob is ours, so nothing ever writes
+                                // JobFailReason on this path - and fire
+                                // suppresses every other option, so with no
+                                // reason here the list comes back empty and
+                                // the float menu never opens at all. Looks
+                                // exactly like a dead right-click. Hardcoded
+                                // because vanilla has no string for an option
+                                // it never offers.
+                                failReason = "unreachable, or already being dealt with";
+                                failThing = thing;
+                            }
                         }
                         catch
                         {
@@ -543,6 +570,70 @@ namespace DoNotBeLazy.Patches
             }
 
             return LocalTargetInfo.Invalid;
+        }
+
+        // Scoping for the pawn-side feedback. Without it every eligible def
+        // in the game gets to complain about every click - the target-side
+        // entries dodge that by only speaking when a WorkGiver actually
+        // wrote a reason, and this is the same idea one step earlier.
+        // Cell-scanned defs (sow) are left out for the same reason
+        // FindTargetWithJob leaves them out: bare ground is the normal case,
+        // not something worth explaining.
+        private static bool WantsSomethingHere(WorkGiverDef def, List<Thing> thingsHere, bool fireHere)
+        {
+            // on a burning cell fire is all we offer, so "why can't they
+            // fight it" is always the question the player is asking
+            if (fireHere)
+            {
+                return true;
+            }
+
+            try
+            {
+                ThingRequest req = ((WorkGiver_Scanner)def.Worker).PotentialWorkThingRequest;
+                if (req.IsUndefined)
+                {
+                    return false;
+                }
+                foreach (Thing thing in thingsHere)
+                {
+                    if (req.Accepts(thing))
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch
+            {
+                // swallow - a def that can't say what it wants doesn't
+                // get to explain itself either
+            }
+
+            return false;
+        }
+
+        // First pawn in the selection with something to say, not a tally of
+        // all of them - a group is usually refused for one shared reason and
+        // naming one of them is enough to explain the click.
+        private static string FirstRefusal(List<Pawn> pawns, Map map, WorkGiverDef def, out Pawn who)
+        {
+            foreach (Pawn pawn in pawns)
+            {
+                if (pawn == null || pawn.Map != map)
+                {
+                    continue;
+                }
+
+                string reason = PawnValidator.RefusalReason(pawn, def);
+                if (reason != null)
+                {
+                    who = pawn;
+                    return reason;
+                }
+            }
+
+            who = null;
+            return null;
         }
 
         private static List<Pawn> EligiblePawns(List<Pawn> pawns, Map map, WorkGiverDef def)

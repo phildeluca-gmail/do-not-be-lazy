@@ -1,17 +1,18 @@
-<!-- Pickup context for a fresh session. Updated 2026-08-20. Read this first, then CLAUDE.md's referenced docs as usual. -->
+<!-- Pickup context for a fresh session. Updated 2026-08-22. Read this first, then CLAUDE.md's referenced docs as usual. -->
 
 # Pickup: Do Not Be Lazy
 
-Resume **this** conversation (vehicle-packing investigation, doc commit
-`c19f816`) with:
+Resume **this** conversation (findings 1+2 fixed, Urgency cleared, job
+diagnostics built, `/pull-logs`) with:
 
 ```
-claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9
+claude --resume 6ed5db2f-8d09-4435-ab6c-2fb321b5823c
 ```
 
 Earlier sessions, for reference only:
 
 ```
+OLD: claude --resume 4b475e1d-24b5-48e9-94e4-f6ce4865faa9   (vehicle-packing diagnosis, TEST_PLAN conversion)
 OLD: claude --resume 5e862c7c-fa2b-40a6-b221-e0174424c01f   (08-18 review: six findings, radius, standing-still)
 OLD: claude --resume 9fe56f23-dbd5-4515-818c-6170fe4921d1   (fire sweeps / need-pause fix / menu feedback)
 OLD: claude --resume 88fc941c-80ed-4d29-b235-7b39abac91ce   (consume/log triage)
@@ -26,10 +27,14 @@ log. This file is the fast-orientation summary.
 
 ## How the user wants to be talked to
 
-**Brief text when possible.** Short answers, no restating what was just
-asked, no padding around a result. Depth on request. This applies to
-chat replies - the docs in this repo stay dense on purpose, that's their
-job.
+**Shorter than you think.** Stated again on 2026-08-20 and this is the
+second tightening - go **lower verbosity than previous sessions**, not
+the same. Answer the question and stop. No restating what was asked, no
+preamble, no summary of what you just did when the diff already says it,
+no bulleted recap of a two-line result. Depth only when asked for.
+
+This governs **chat replies only** - the docs in this repo stay dense on
+purpose, that's their job. Do not "helpfully" trim the docs to match.
 
 Also still true: don't paste whole logs (see the extraction workflow
 below), and only commit when explicitly asked.
@@ -47,22 +52,48 @@ critical needs (hunger/rest/joy/mood).
 
 - Builds clean: `cd DoNotBeLazy/Source/DoNotBeLazy && dotnet build`
   (0 errors, 0 warnings).
-- Working tree clean as of the last commit, `c19f816` (doc-only). Check
-  `git log` rather than trusting this line - this file has been stale
-  about commit state twice now and it cost time both times.
-- **Last code commit is still `9dc8717`.** Neither the 2026-08-18
-  evening review session nor the 2026-08-19/20 vehicle investigation
-  changed any code. `c19f816` was the docs for both.
-- **Test state for the 2026-08-18 code is UNCONFIRMED.** The overnight
-  session ended without the DLL being copied into the RimWorld `Mods/`
-  folder, and nobody established whether the sessions played since were
-  running the 08-18 build. **Ask before treating fire sweeps, the
-  need-pause fix, or the menu feedback as verified.**
+- **Everything was committed and pushed at the end of 2026-08-22** -
+  the findings 1+2 fix, the job diagnostics, `/pull-logs`, `TEST_PLAN.md`
+  and all doc corrections. Run `git log -1` and `git status` anyway
+  rather than trusting this line: it has been stale twice and cost time
+  both times.
+- **2026-08-22 shipped real code** after four doc-only sessions:
+  `FloatMenuPatch` + `PawnValidator` (review findings 1 and 2), and
+  three new diagnostic files (`PipelineCensus`, `JobSourcePatch`,
+  `IdleProbe`) behind a new `jobDiagnostics` setting. **None of it has
+  run in a game yet.**
+- **The installed DLL is older than the repo build.** Copy
+  `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` (+ `.pdb`) into
+  `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\`
+  and restart RimWorld before testing anything from 08-21/22. The user
+  does this step manually.
+- **RESOLVED 2026-08-22: the 08-18 build has been under test since
+  2026-08-18.** The installed DLL in
+  `RimWorld\Mods\DoNotBeLazy\Assemblies\` is dated 08-18 22:07, so
+  every session since ran the fire-sweep / need-pause / menu-feedback
+  code. Three sessions of "ask the user whether it was copied" answered
+  by one `ls`. **The corollary: the 08-21/22 work is NOT installed** -
+  copy the DLL before testing any of it. `/pull-logs` now checks this
+  first.
 - Still untested from before: **the sow fixes** (`cc502c9`). Phase 1 of
   the playtest plan has still not been run.
 - **What IS verified in game (2026-08-17):** verbose logging works, and
   a `HaulMerge` sweep runs end to end. Still the only confirmed working
   sweep from a real save.
+
+## Start here next session
+
+1. **Copy the DLL over and restart the game** (above). Nothing from the
+   last two days has been in front of RimWorld yet.
+2. **Tick both checkboxes** - "Verbose logging" *and* the new "Job
+   diagnostics" - then reproduce the standing-still report and say
+   `/pull-logs standing still`. The instruments were built specifically
+   for that repro and have never emitted a line.
+3. **While you're in there:** the findings 1+2 fix means a right-click
+   that used to do nothing should now show a greyed `* ... until done -
+   <pawn>: is not assigned to hauling`-style entry, and a burning tile
+   should always open *some* menu. Both are easy to check in passing.
+4. Then `TEST_PLAN.md` Phase 1, which has still never been run.
 
 ## Open item 1: vehicle packing offers no `* pack until done`
 
@@ -105,19 +136,26 @@ that cannot throw.
 ## Open item 2: colonists standing still
 
 Reported from play, 2026-08-18: **"workers are back to standing still
-when hunt is not assigned."** Not diagnosed - no repro, no log pulled,
-no code touched. **"Back to"** is the important word: a returning
-symptom, not a first sighting.
+when hunt is not assigned."** **"Back to"** is the important word: a
+returning symptom, not a first sighting.
+
+**2026-08-21: retested with Sense of Urgency disabled and it still
+happens**, to pawns assigned to Hunting. That mod is ruled out twice
+over now - by this test and by its own files. Three instruments to name
+the real cause are designed in architecture doc section 0 and **not
+built**; the free one to run first is a second log extraction that greps
+vanilla's errors rather than only our `[DoNotBeLazy]` lines, which no
+extraction has ever done.
 
 Check in this order:
 
-1. **Disable Sense of Urgency and retest.** `ZombiePhil.Urgency`
-   (Workshop 3001253573) is built against 1.6 and throws on
-   `Toils_General.WaitWith` in 1.5, and hunting is the specific thing it
-   breaks - already documented below as hunters looping "started 10 jobs
-   in 10 ticks" forever. A WorkGiver throwing inside
-   `TryFindAndStartJob` can leave a pawn with no job at all, which looks
-   exactly like standing still.
+1. **Disable Automatic Hunting and retest.**
+   `Arylice.Rimworld.AutomaticHunting` (Workshop 3340648302) is the mod
+   that throws on `Toils_General.WaitWith` - corrected 2026-08-21, this
+   was blamed on Sense of Urgency for three sessions and was never true
+   of it (see below). It also throws every tick in `GameComponentTick`.
+   Something throwing inside `TryFindAndStartJob` can leave a pawn with
+   no job at all, which looks exactly like standing still.
 2. **Disable Do Not Be Lazy entirely and retest.** That single test
    separates our bug from the modlist's, and nothing else does.
 3. **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`
@@ -139,21 +177,24 @@ pawn whose think tree is throwing just re-throws every two seconds.
 All six are in the overnight session's own new code. Full detail in
 architecture doc section 0.
 
-1. **Menu feedback misses pawn-side refusals** -
-   `FloatMenuPatch.cs:204`. `EligiblePawns` empty -> `continue` before
-   any feedback is built, so "Hauling is priority 0", "pawn is drafted",
-   "no Manipulation" still produce silent nothing. Plausibly the real
-   answer to the stone-blocks report, alongside `NoEmptyPlaceLower`.
-2. **A burning cell can produce a completely empty menu** -
-   `FloatMenuPatch.cs:198`. Fire suppresses every other def and
-   `* Consume`, and `FireCompat.HasFireJob` never sets `JobFailReason`,
-   so a refusal there leaves zero entries and zero explanation.
-3. **Duplicate fire entries under Sense of Urgency** -
-   `IsFirefighting` keys on `workType.defName`, so that mod's parallel
-   urgent def matches too. **Same class as the vehicle duplicate:**
-   `PackVehicleTurret` also carries the label "pack vehicle" and also
-   targets the `VehiclePawn`, so a vehicle needing cargo *and* turret
-   ammo would show `* Pack vehicle until done` twice. Fix both here.
+1. **FIXED 2026-08-21, untested in game - menu feedback missed
+   pawn-side refusals.** `EligiblePawns` empty used to `continue` before
+   any feedback was built, so "Hauling is priority 0", "pawn is
+   drafted", "no Manipulation" produced silent nothing. Now
+   `PawnValidator.RefusalReason` names the reason and the first refusing
+   pawn, scoped to defs whose `PotentialWorkThingRequest` accepts
+   something on the clicked cell. **Watch for this in the stone-blocks
+   repro** - it is the likelier answer there than `NoEmptyPlaceLower`.
+2. **FIXED 2026-08-21, untested in game - a burning cell could produce
+   NO MENU AT ALL.** Not an empty menu; the window never opened.
+   `FindTargetWithJob` now writes a hardcoded reason when a `Fire`
+   yields no job, so there is always at least one entry to render.
+3. **Duplicate `* Pack vehicle until done`** - `PackVehicleTurret`
+   carries the same label as `PackVehicle` and also targets the
+   `VehiclePawn`, so a vehicle needing cargo *and* turret ammo shows the
+   entry twice. **The Sense of Urgency half of this finding is
+   withdrawn** (2026-08-21): that mod adds no `Firefighter` def, and
+   nothing sweep-eligible at all.
 4. **Paused sweeps now survive interrupts that used to end them** -
    `SweepManager.cs:365`. A manual player order during a pause no longer
    ends the sweep; the pawn is pulled back when it finishes. Looks
@@ -168,8 +209,10 @@ architecture doc section 0.
    rescannable sweep. **That same `break` is half of vehicle-packing
    cause 2** - fixing one should fix the other.
 
-1 and 2 are the two worth fixing before the playtest - both sit inside
-the change that was specifically about not leaving the player guessing.
+1 and 2 are done as of 2026-08-21 and **need a look during the
+playtest** - neither has been seen in a running game. 3-6 are still
+open. `TEST_PLAN.md` has no tests for either, since it predates the
+whole feedback change.
 
 ## Verified in earlier sessions (don't re-derive)
 
@@ -208,11 +251,10 @@ the change that was specifically about not leaving the player guessing.
 
 ## Test plan
 
-A 26-test playtest plan is published here:
-
-```
-https://claude.ai/code/artifact/e60cfd11-1f82-46a8-9111-a25d9352a2dd
-```
+The playtest plan now lives in the repo as **`TEST_PLAN.md`** - plain
+markdown, readable without a browser (the published artifact at
+`https://claude.ai/code/artifact/e60cfd11-1f82-46a8-9111-a25d9352a2dd`
+is the older HTML original and is no longer the source of truth).
 
 Phase 0 (prove the DLL is current, the logger is live, and the
 `wantedPlantDef` reflection resolved) passes as of 2026-08-17. **Phase 1
@@ -220,10 +262,12 @@ Phase 0 (prove the DLL is current, the logger is live, and the
 fire-sweep and menu-feedback work, so it has no tests for either, and
 nothing for vehicles.
 
-One correction to that plan: T3.5 says food yields `* Eat meal`. Wrong.
-Only drugs set `ingestCommandString` in Core, so food and corpses fall
-through to our hardcoded `"Consume " + LabelShort` and read
-`* Consume fine meal`.
+Three corrections are already folded into `TEST_PLAN.md` and marked in
+place: T0.1 hardcoded a stale DLL timestamp, T3.5 wrongly said food
+yields `* Eat meal` (only drugs set `ingestCommandString`, so food reads
+`* Consume fine meal`), and **T3.6 was inverted by `9dc8717`** - it
+still expected a burning tile to offer nothing, which was true before
+fire sweeps shipped.
 
 ## The float-menu path is still mostly untraced
 
@@ -275,10 +319,25 @@ whether that code path logs at all (see the float-menu note above).
 
 ## Workflow: log extraction
 
-1. Options > Mod Settings > Do Not Be Lazy > tick "Verbose logging".
-   Close the settings window - that's what writes it to disk.
+**Say `/pull-logs` and Claude does all of this.** The command lives at
+`.claude/commands/pull-logs.md` and is checked into the repo. It checks
+which build actually produced the log (installed DLL vs built DLL vs log
+timestamp - step 1, because that has been wrong twice), extracts the
+`[DoNotBeLazy]` trace *and* vanilla's own exception lines *and* the
+active mod block, archives all three to a gitignored `logs/` folder with
+a timestamp, and summarizes without pasting. Pass it a focus if you have
+one: `/pull-logs standing still`.
+
+**Never extract only `[DoNotBeLazy]` again.** Every extraction before
+2026-08-22 did exactly that, which is why vanilla's `Exception in
+WorkGiver X` lines - the loud half of any job bug - were never once in
+front of us.
+
+1. Options > Mod Settings > Do Not Be Lazy > tick "Verbose logging",
+   and "Job diagnostics" for anything job/idle related. Close the
+   settings window - that's what writes it to disk.
 2. Reproduce.
-3. Extract (Claude can run this directly, no need to paste):
+3. `/pull-logs`. The manual version, if you want it by hand:
 
 ```
 Select-String -Path "$env:USERPROFILE\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Player.log" -Pattern '\[DoNotBeLazy\]' | ForEach-Object { $_.Line }
@@ -286,7 +345,16 @@ Select-String -Path "$env:USERPROFILE\AppData\LocalLow\Ludeon Studios\RimWorld b
 
 RimWorld truncates `Player.log` on launch - extract before restarting.
 
-Trace lines emitted: `BeginSweep <def>: N targets, M pawns` /
+Diagnostic lines emitted when "Job diagnostics" is on (new 2026-08-22,
+all untested in game): `pipeline <method>: prefix=<owner>, ...` once at
+startup / `job <pawn>: <JobDef> from <ThinkNode> [<assembly>] (tree X)`
+for idle-shaped jobs only / `idle <pawn>: no job - drafted=.. mental=..
+hunting=..` every 250 ticks. **An assembly other than `Assembly-CSharp`
+in a `job` line names the mod outright**, and an `idle` pawn with no
+`job` lines at all means `DetermineNextJob` returned NoJob - a different
+bug from a pawn looping on wait jobs.
+
+Sweep trace lines emitted: `BeginSweep <def>: N targets, M pawns` /
 `scan <def> r=N at <cell> for <pawn>: N targets` /
 `<pawn>: <JobDef> on <target> plant=<def> (N left)` /
 `<pawn>: no job for <target>` / `<pawn>: job ended <condition>` /
@@ -311,8 +379,12 @@ On our code paths:
   `EligibleDefs()` calls on every def), `ListerThings.ThingsMatching`,
   `WorkGiver_Haul.PotentialWorkThingsGlobal`.
 - **TKS Priority Treatment** patches `Pawn_JobTracker.TryFindAndStartJob`.
-- **Sense of Urgency** adds parallel "urgent" WorkGiverDefs - a likely
-  source of duplicate `*` options, and worth disabling when testing.
+- **Sense of Urgency** adds parallel "urgent" WorkGiverDefs, but they
+  are workType `Urgent`/`Doctor`/`Cooking`/`Hunting` and none of their
+  givers is a `WorkGiver_DoBill` - so **none of them is sweep-eligible**
+  and it cannot duplicate or alter any `*` option. Verified 2026-08-21
+  from its own defs; it had been listed as a likely duplicate source on
+  no evidence.
 - **Reclaim, Reuse, Recycle** adds the harvesting/refurbishment tables
   (both `WorkGiver_DoBill`, so both are sweep-eligible).
 - **Vehicle Framework** (Workshop `3014915404`) prefixes
@@ -327,15 +399,21 @@ On our code paths:
 
 ## Two broken third-party mods - ignore their log noise
 
-Both compiled against RimWorld 1.6, calling a 7-parameter overload where
-1.5 has 6. Neither is our bug.
+**Corrected 2026-08-21 - there is only one, and it is not the one this
+file named for three sessions.**
 
-- **Sense of Urgency** (`ZombiePhil.Urgency`, Workshop 3001253573) -
-  `Toils_General.WaitWith`. **Hunting is completely broken**: hunters
-  loop "started 10 jobs in 10 ticks" forever. Recommend disabling. Prime
-  suspect for the standing-still report above.
-- **Automatic Hunting** (`Arylice.Rimworld.AutomaticHunting`) -
-  `TraverseParms.For`, throws every tick in `GameComponentTick`.
+- **Automatic Hunting** (`Arylice.Rimworld.AutomaticHunting`, Workshop
+  3340648302) - `TraverseParms.For`, throwing every tick in
+  `GameComponentTick`, **and** `Toils_General.WaitWith`. It is the only
+  mod in the installed workshop folder that references `WaitWith` at
+  all. Prime suspect for the standing-still report. Recommend disabling.
+- **Sense of Urgency** (`ZombiePhil.Urgency`, Workshop 3001253573) is
+  **cleared**. It ships a real 1.5 assembly
+  (`1.5/Assemblies/ZombiePhil.Urgency.v15.dll`, April 2025) which
+  contains no `WaitWith`, no `Toils_General`, no `JobDriver` and no
+  Harmony reference - WorkGivers only. The "hunting is completely
+  broken" symptom was pinned on it because it has a hunting-priority
+  WorkGiver, not because anything in it throws.
 
 ## Still-open bugs in our code (not yet fixed)
 
@@ -370,8 +448,9 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
    which the new disabled entries will surface), or Hauling sitting at
    priority 0 for the selected pawns (which they will **not** surface -
    review finding 1).
-2. **"The `* forced delivery to (ITEM)` is gone."** Needs a repro, and
-   re-checking with Sense of Urgency disabled.
+2. **"The `* forced delivery to (ITEM)` is gone."** Needs a repro.
+   Sense of Urgency is no longer a candidate explanation - none of its
+   defs is sweep-eligible (2026-08-21).
 
 ## Planned but NOT implemented - do not build without a fresh go-ahead
 
@@ -477,8 +556,11 @@ Both compiled against RimWorld 1.6, calling a 7-parameter overload where
 - User wants `DoNotBeLazy_Architecture.md` updated after essentially
   every turn - keep doing that. Per CLAUDE.md, doc edit precedes code.
 - User tests by manually copying the built DLL into their RimWorld
-  `Mods/DoNotBeLazy/` folder and fully restarting the game. **Whether
-  the 2026-08-18 build has been copied over is still unconfirmed - ask.**
+  `Mods/DoNotBeLazy/` folder and fully restarting the game. **Don't ask
+  whether it was copied - look.** Compare
+  `DoNotBeLazy/Assemblies/DoNotBeLazy.dll` against
+  `E:\SteamLibrary\steamapps\common\RimWorld\Mods\DoNotBeLazy\Assemblies\DoNotBeLazy.dll`;
+  `/pull-logs` does this as step 1.
 - `gh` CLI is not installed on this machine.
 - Commit message style: detailed body explaining *why*. **Only commit
   when explicitly asked.**

@@ -15,3 +15,6 @@ Thumbs.db
 
 # Local Claude Code settings (machine-specific, not shared)
 .claude/settings.local.json
+
+# Extracted RimWorld logs (pulled by /pull-logs, machine-specific)
+logs/
